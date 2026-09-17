@@ -4508,16 +4508,16 @@ fn paint_laid_dom_scrolled(
                 if !painted && name.local.as_ref() == "img" {
                     match node.get_attribute("alt") {
                         Some(alt) if !alt.trim().is_empty() => {
-                            draw_text(
+                            draw_shaped_text(
+                                &mut laid.text_engine,
                                 &mut pixmap,
                                 &alt,
                                 rect.x,
                                 rect.y,
                                 [0, 0, 0, 255],
                                 12.0,
-                                false,
-                                None,
-                                0.0,
+                                true,
+                                style,
                                 clip,
                                 element_clip_mask,
                                 raster_scale,
@@ -4638,23 +4638,24 @@ fn paint_laid_dom_scrolled(
             if let Some(marker) = list_marker_text(tree, nid, style.list_style) {
                 let fsize = style.font_size.unwrap_or(16.0);
                 let color = style.color.unwrap_or([0, 0, 0, 255]);
-                let mw = measure_text(&marker, fsize, false, style.font_family.as_deref());
-                let mx = rect.x + style.padding.left - mw - 6.0;
-                let my = rect.y + style.border.top + style.padding.top;
-                draw_text(
-                    &mut pixmap,
-                    &marker,
-                    mx,
-                    my,
-                    color,
-                    fsize,
-                    false,
-                    style.font_family.as_deref(),
-                    style.letter_spacing.unwrap_or(0.0),
-                    clip,
-                    element_clip_mask,
-                    raster_scale,
-                );
+                let mut marker_style = style.clone();
+                marker_style.color = Some(color);
+                marker_style.font_size = Some(fsize);
+                marker_style.font_weight = Some("400".to_string());
+                if let Some(item) = laid.text_engine.push_generated_text(&marker, &marker_style) {
+                    let (mw, _) = laid.text_engine.measure(item, None);
+                    let mx = rect.x + style.padding.left - mw - 6.0;
+                    let my = rect.y + style.border.top + style.padding.top;
+                    laid.text_engine.finalize(item, (mx, my), mw, clip);
+                    laid.text_engine.paint_item_with_clip_mask_scaled(
+                        item,
+                        &mut pixmap,
+                        (0.0, 0.0),
+                        clip,
+                        element_clip_mask,
+                        raster_scale,
+                    );
+                }
             }
         }
 
@@ -4706,16 +4707,16 @@ fn paint_laid_dom_scrolled(
                 let line_height = crate::inline::used_line_height(style);
                 let text_x = rect.x + style.border.left + style.padding.left;
                 let text_y = rect.y + (rect.height - line_height) / 2.0;
-                draw_text(
+                draw_shaped_text(
+                    &mut laid.text_engine,
                     &mut pixmap,
                     &label,
                     text_x,
                     text_y,
                     style.color.unwrap_or([0, 0, 0, 255]),
                     fsize,
-                    crate::style::used_font_weight(style) >= 600,
-                    style.font_family.as_deref(),
-                    style.letter_spacing.unwrap_or(0.0),
+                    false,
+                    style,
                     Some(visible_rect),
                     element_clip_mask,
                     raster_scale,
@@ -4835,16 +4836,16 @@ fn paint_laid_dom_scrolled(
                             value
                         };
                         if color[3] != 0 {
-                            draw_text(
+                            draw_shaped_text(
+                                &mut laid.text_engine,
                                 &mut pixmap,
                                 shown,
                                 text_x,
                                 text_y,
                                 color,
                                 fsize,
-                                false,
-                                style.font_family.as_deref(),
-                                style.letter_spacing.unwrap_or(0.0),
+                                true,
+                                style,
                                 clip,
                                 element_clip_mask,
                                 raster_scale,
@@ -4869,16 +4870,16 @@ fn paint_laid_dom_scrolled(
                             .clamp(0.0, 1.0);
                         color[3] = ((color[3] as f32) * opacity).round() as u8;
                         if color[3] != 0 {
-                            draw_text(
+                            draw_shaped_text(
+                                &mut laid.text_engine,
                                 &mut pixmap,
                                 placeholder,
                                 text_x,
                                 text_y,
                                 color,
                                 fsize,
-                                false,
-                                style.font_family.as_deref(),
-                                style.letter_spacing.unwrap_or(0.0),
+                                true,
+                                style,
                                 clip,
                                 element_clip_mask,
                                 raster_scale,
@@ -7073,6 +7074,52 @@ fn draw_text(
                 + letter_spacing * raster_scale;
         }
     }
+}
+
+/// Paint attribute-derived text that has no backing DOM text node (element
+/// `value`/`placeholder`/`alt`, a `<select>`'s selected-option label, a
+/// `<li>` marker) through the same cosmic-text `TextEngine` and loaded font
+/// database as ordinary inline content, instead of `draw_text`'s
+/// `ab_glyph`-only, 4-bundled-font fallback. This is what lets `--font-dir`
+/// (e.g. CJK faces) reach these call sites at all.
+fn draw_shaped_text(
+    text_engine: &mut crate::inline::TextEngine,
+    pixmap: &mut Pixmap,
+    text: &str,
+    x: f32,
+    y: f32,
+    color: [u8; 4],
+    fsize: f32,
+    force_weight_normal: bool,
+    style: &crate::LayoutStyle,
+    clip: Option<crate::Rect>,
+    clip_mask: Option<&tiny_skia::Mask>,
+    raster_scale: f32,
+) {
+    if let Some(c) = clip {
+        if c.width <= 0.0 || c.height <= 0.0 {
+            return;
+        }
+    }
+    let mut item_style = style.clone();
+    item_style.color = Some(color);
+    item_style.font_size = Some(fsize);
+    if force_weight_normal {
+        item_style.font_weight = Some("400".to_string());
+    }
+    let Some(item) = text_engine.push_generated_text(text, &item_style) else {
+        return;
+    };
+    let (text_width, _) = text_engine.measure(item, None);
+    text_engine.finalize(item, (x, y), text_width, clip);
+    text_engine.paint_item_with_clip_mask_scaled(
+        item,
+        pixmap,
+        (0.0, 0.0),
+        clip,
+        clip_mask,
+        raster_scale,
+    );
 }
 
 /// Resolve `src` (a `data:` URI, or an absolute/relative URL against

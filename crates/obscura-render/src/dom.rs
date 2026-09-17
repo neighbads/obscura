@@ -107,10 +107,18 @@ fn native_button_intrinsic_content(
             return;
         }
 
+        // A generic `inline-block` box (e.g. a CSS icon) is atomic for the
+        // containing inline formatting context: it lays out independently
+        // and contributes its own outer width rather than the text found by
+        // recursing into it. Only intercept the definite-width case here;
+        // an auto-width inline-block still falls through to the recursive
+        // walk below, which at least approximates its text content.
         let is_atomic = matches!(
             element.local.as_ref(),
             "svg" | "img" | "video" | "canvas" | "iframe" | "embed" | "object"
-        );
+        ) || style.is_some_and(|style| {
+            style.is_inline_block && definite_inline_size(style.width, font_size).is_some()
+        });
         if is_atomic {
             if let Some(style) = style {
                 if let Some(width) = definite_inline_size(style.width, font_size) {
@@ -15393,6 +15401,38 @@ mod tests {
             (sorted[0].1 - 40.0).abs() < 0.1 && (sorted[1].1 - 60.0).abs() < 0.1,
             "children heights should be 40 and 60, got {:?}",
             sorted
+        );
+    }
+
+    #[test]
+    fn nested_flex_button_badge_icon_contributes_to_intrinsic_width() {
+        // A native auto-width `<button>` whose label is a `display:inline-block`
+        // icon (not a replaced `<svg>`/`<img>`) plus text, nested inside its own
+        // flex badge wrapper. The icon's definite width must contribute to the
+        // button's shrink-to-fit intrinsic width like a replaced element would,
+        // not be silently dropped by the label-only text walk.
+        let tree = parse_html(
+            r#"<style>html,body{margin:0}
+              button{flex-shrink:0;padding:0 8px;height:36px;position:relative;border:0}
+              .badge{align-items:center;display:flex;justify-content:center;position:relative}
+              .icon{display:inline-block;width:20px;height:20px;background:#555}
+              </style>
+              <div style="display:flex">
+                <button id="btn"><div class="badge"><span class="icon"></span><span id="txt" style="font-family:arial;font-size:14px">AI Mode</span></div></button>
+              </div>"#,
+        );
+        let laid = layout_dom(&tree, (1200.0, 600.0));
+        let rect = |id: &str| laid.rects[&tree.get_element_by_id(id).unwrap()];
+        let btn = rect("btn");
+        let txt = rect("txt");
+        // The pre-bake heuristic approximates the label's text width, so it
+        // won't match the final measured text rect pixel-for-pixel; assert
+        // it's in the right ballpark rather than exact. Before the fix the
+        // icon's 20px was dropped entirely, giving a width close to
+        // txt.width + 16.
+        assert!(
+            (btn.width - (20.0 + txt.width + 16.0)).abs() < 5.0,
+            "button width must include the icon's 20px plus the label plus 16px padding: btn={btn:?} txt={txt:?}"
         );
     }
 

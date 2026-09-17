@@ -8994,7 +8994,7 @@ fn paint_in_flow_generated_box(
 
 fn paint_positioned_pseudo(
     text_engine: &mut crate::inline::TextEngine,
-    pixmap: &mut Pixmap,
+    dest_pixmap: &mut Pixmap,
     style: &crate::LayoutStyle,
     containing_block: &crate::Rect,
     static_position_rect: &crate::Rect,
@@ -9009,6 +9009,17 @@ fn paint_positioned_pseudo(
     if style.position != Some(taffy::Position::Absolute) {
         return;
     }
+    // `style.opacity` is otherwise applied by wrapping a real DOM node's
+    // subtree in an isolated layer (see `own_opacity` above). A positioned
+    // `::before`/`::after` pseudo has no `NodeId` of its own to hang that
+    // logic off of, so it was painted straight onto `dest_pixmap` at full
+    // alpha regardless of `opacity` — an `opacity:0` pseudo (a common
+    // hover-reveal pattern) rendered fully visible instead of being hidden.
+    let pseudo_opacity = style.opacity.unwrap_or(1.0).clamp(0.0, 1.0);
+    if pseudo_opacity <= 0.0 {
+        return;
+    }
+    let mut paint_onto = |pixmap: &mut Pixmap| {
     let em = style.font_size.unwrap_or(16.0);
     let resolve = |dimension: crate::Dimension, basis: f32| match dimension.resolve(
         em,
@@ -9273,6 +9284,27 @@ fn paint_positioned_pseudo(
             element_clip_mask.as_ref(),
             raster_scale,
         );
+    }
+    };
+    if pseudo_opacity < 1.0 {
+        let Some(mut layer) = Pixmap::new(dest_pixmap.width(), dest_pixmap.height()) else {
+            return;
+        };
+        paint_onto(&mut layer);
+        let group_paint = tiny_skia::PixmapPaint {
+            opacity: pseudo_opacity,
+            ..tiny_skia::PixmapPaint::default()
+        };
+        dest_pixmap.draw_pixmap(
+            0,
+            0,
+            layer.as_ref(),
+            &group_paint,
+            tiny_skia::Transform::identity(),
+            None,
+        );
+    } else {
+        paint_onto(dest_pixmap);
     }
 }
 
@@ -11604,6 +11636,40 @@ mod tests {
         assert!(
             pixmap.is_some(),
             "a pathological transform layer must not abort the entire page paint"
+        );
+    }
+
+    #[test]
+    fn positioned_before_pseudo_honors_opacity_zero() {
+        let tree = parse_html(
+            r#"<html style="margin:0"><body style="margin:0;background:white">
+                <style>
+                  .pill {
+                    position: relative;
+                    width: 40px; height: 36px;
+                    border-radius: 100px;
+                    background: rgb(243,245,246);
+                  }
+                  .pill:before {
+                    content: "";
+                    position: absolute;
+                    inset: 0;
+                    border-radius: inherit;
+                    opacity: 0;
+                    background-color: #000;
+                  }
+                </style>
+                <div id="pill" class="pill"></div>
+            </body></html>"#,
+        );
+        let pixmap = paint_dom(&tree, (100.0, 100.0), None).expect("pill paint");
+        let center = pixmap.pixel(20, 18).expect("pill center");
+        assert!(
+            center.red() > 200 && center.green() > 200 && center.blue() > 200,
+            "expected light gray pill, got r={} g={} b={}",
+            center.red(),
+            center.green(),
+            center.blue()
         );
     }
 

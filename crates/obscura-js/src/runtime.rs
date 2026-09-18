@@ -5761,6 +5761,26 @@ mod tests {
         );
     }
 
+    // R-17 — innerText was wrongly aliased to textContent, so it included
+    // <script>/<style> content verbatim and never separated block elements
+    // with newlines. Must work without the render feature since innerText is
+    // a DOM-shape approximation, not a layout query.
+    #[test]
+    fn inner_text_skips_script_and_style_and_separates_blocks_with_newlines() {
+        let mut rt = setup_runtime(
+            r#"<html><head><style>.x{color:red}</style></head>
+<body><style>.y{color:blue}</style><script>var z=1;</script><p>Hello</p><p>World</p></body></html>"#,
+        );
+        let inner_text = rt.evaluate("document.body.innerText").unwrap();
+        assert_eq!(inner_text, serde_json::json!("Hello\n\nWorld"));
+
+        let text_content = rt.evaluate("document.body.textContent").unwrap();
+        assert!(
+            text_content.as_str().unwrap().contains("color:blue") || text_content.as_str().unwrap().contains("var z=1"),
+            "sanity check: textContent (unlike innerText) still includes script/style text: {text_content}"
+        );
+    }
+
     #[test]
     fn replace_state_without_url_preserves_current_location() {
         let mut rt = setup_runtime("<html><body></body></html>");

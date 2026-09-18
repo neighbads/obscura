@@ -1479,6 +1479,21 @@ impl DomTree {
         result
     }
 
+    /// Approximates `HTMLElement.innerText`: unlike `textContent`, it skips
+    /// non-rendered content (`script`/`style`/`template`/`title`/`noscript`)
+    /// and inserts newlines around block-level elements so paragraph/heading/
+    /// list boundaries are visible in the returned string. This is a DOM-shape
+    /// approximation, not a layout-based rendering: it does not consult CSS
+    /// `display`, does not soft-wrap to a line width, and does not hide
+    /// elements styled `display:none` (real innerText does both, but that
+    /// requires the layout engine, which is not available to JS-only builds).
+    pub fn inner_text(&self, node_id: NodeId) -> String {
+        let inner = self.inner.borrow();
+        let mut result = String::new();
+        collect_inner_text(&inner, node_id, &mut result);
+        result.trim_matches(is_html_whitespace).to_string()
+    }
+
     pub fn append_text(&self, parent_id: NodeId, text: &str) {
         let last_child_is_text = {
             let inner = self.inner.borrow();
@@ -1767,6 +1782,162 @@ fn collect_text_inner(inner: &DomTreeInner, node_id: NodeId, buf: &mut String) {
                 }
                 for child_id in kids.into_iter().rev() {
                     stack.push(child_id);
+                }
+            }
+        }
+    }
+}
+
+fn is_html_whitespace(c: char) -> bool {
+    matches!(c, '\t' | '\n' | '\x0C' | '\r' | ' ')
+}
+
+/// Appends a text node's contents to an innerText accumulator, collapsing
+/// runs of HTML whitespace to a single space the same way adjacent rendered
+/// text is visually separated, and tracking whether a space is still owed at
+/// a text-node boundary. Mirrors `append_readable_text_segment` in
+/// obscura-cli's `--dump text` path.
+fn append_inner_text_segment(result: &mut String, pending_space: &mut bool, contents: &str) {
+    let trimmed = contents.trim_matches(is_html_whitespace);
+    if trimmed.is_empty() {
+        if contents.chars().any(is_html_whitespace) {
+            *pending_space = true;
+        }
+        return;
+    }
+
+    let begins_with_space = contents.chars().next().is_some_and(is_html_whitespace);
+    let result_ends_with_space = result.chars().next_back().is_some_and(char::is_whitespace);
+    if (*pending_space || begins_with_space) && !result.is_empty() && !result_ends_with_space {
+        result.push(' ');
+    }
+    result.push_str(trimmed);
+    *pending_space = contents.chars().next_back().is_some_and(is_html_whitespace);
+}
+
+/// Iterative pre-order walk building up `HTMLElement.innerText`'s
+/// approximation: skips non-rendered elements outright (their subtree is not
+/// visited), and wraps block-level elements' content in newlines. Uses an
+/// explicit heap stack rather than recursion for the same deep-tree reason as
+/// `collect_text_inner`.
+fn collect_inner_text(inner: &DomTreeInner, node_id: NodeId, buf: &mut String) {
+    enum Work {
+        Visit(NodeId),
+        Newline,
+    }
+
+    let max_steps = inner.nodes.len().saturating_add(16);
+    let mut steps = 0usize;
+    let mut pending_space = false;
+    let mut stack: Vec<Work> = vec![Work::Visit(node_id)];
+
+    while let Some(work) = stack.pop() {
+        let id = match work {
+            Work::Newline => {
+                buf.push('\n');
+                pending_space = false;
+                continue;
+            }
+            Work::Visit(id) => id,
+        };
+
+        steps += 1;
+        if steps > max_steps {
+            eprintln!("obscura: collect_inner_text cap hit - tree has a cycle");
+            break;
+        }
+
+        let node = match inner.nodes.get(id.index()) {
+            Some(Some(n)) => n,
+            _ => continue,
+        };
+
+        match &node.data {
+            NodeData::Text { contents } => {
+                append_inner_text_segment(buf, &mut pending_space, contents);
+            }
+            NodeData::Element { name, .. } => {
+                let tag = name.local.as_ref();
+
+                // Content that is never rendered as text, regardless of its
+                // display value; real innerText excludes these subtrees too.
+                if matches!(tag, "script" | "style" | "template" | "title" | "noscript") {
+                    continue;
+                }
+
+                let is_block = matches!(
+                    tag,
+                    "div"
+                        | "p"
+                        | "h1"
+                        | "h2"
+                        | "h3"
+                        | "h4"
+                        | "h5"
+                        | "h6"
+                        | "li"
+                        | "tr"
+                        | "br"
+                        | "hr"
+                        | "blockquote"
+                        | "pre"
+                        | "section"
+                        | "article"
+                        | "header"
+                        | "footer"
+                        | "nav"
+                        | "main"
+                        | "aside"
+                        | "figure"
+                        | "figcaption"
+                        | "table"
+                        | "thead"
+                        | "tbody"
+                        | "tfoot"
+                        | "dl"
+                        | "dt"
+                        | "dd"
+                        | "ul"
+                        | "ol"
+                );
+
+                if is_block {
+                    buf.push('\n');
+                    pending_space = false;
+                    stack.push(Work::Newline);
+                }
+
+                let mut kids = Vec::new();
+                let mut child = node.first_child;
+                while let Some(child_id) = child {
+                    kids.push(child_id);
+                    if kids.len() > inner.nodes.len() {
+                        eprintln!("obscura: collect_inner_text sibling cap hit - cycle");
+                        break;
+                    }
+                    child = inner.nodes.get(child_id.index())
+                        .and_then(|n| n.as_ref())
+                        .and_then(|n| n.next_sibling);
+                }
+                for child_id in kids.into_iter().rev() {
+                    stack.push(Work::Visit(child_id));
+                }
+            }
+            _ => {
+                let mut kids = Vec::new();
+                let mut child = node.first_child;
+                while let Some(child_id) = child {
+                    kids.push(child_id);
+                    if kids.len() > inner.nodes.len() {
+                        eprintln!("obscura: collect_inner_text sibling cap hit - cycle");
+                        break;
+                    }
+                    child = inner.nodes.get(child_id.index())
+                        .and_then(|n| n.as_ref())
+                        .and_then(|n| n.next_sibling);
+                }
+                for child_id in kids.into_iter().rev() {
+                    stack.push(Work::Visit(child_id));
                 }
             }
         }
@@ -2166,6 +2337,64 @@ mod tests {
     }
 
     #[test]
+    fn inner_text_skips_non_rendered_and_adds_block_newlines() {
+        // Mirrors the R-17 repro: <body><style>..</style><script>..</script>
+        // <p>Hello</p><p>World</p></body>. innerText must drop the style and
+        // script subtrees entirely and separate the two paragraphs with a
+        // blank line, with no leading/trailing newline in the result.
+        let tree = DomTree::new();
+        let doc = tree.document();
+        let body = element(&tree, "body");
+        tree.append_child(doc, body);
+
+        let style = element(&tree, "style");
+        let style_text = tree.new_node(NodeData::Text { contents: ".y{color:blue}".into() });
+        tree.append_child(style, style_text);
+        tree.append_child(body, style);
+
+        let script = element(&tree, "script");
+        let script_text = tree.new_node(NodeData::Text { contents: "var z=1;".into() });
+        tree.append_child(script, script_text);
+        tree.append_child(body, script);
+
+        let p1 = element(&tree, "p");
+        let p1_text = tree.new_node(NodeData::Text { contents: "Hello".into() });
+        tree.append_child(p1, p1_text);
+        tree.append_child(body, p1);
+
+        let p2 = element(&tree, "p");
+        let p2_text = tree.new_node(NodeData::Text { contents: "World".into() });
+        tree.append_child(p2, p2_text);
+        tree.append_child(body, p2);
+
+        assert_eq!(tree.inner_text(body), "Hello\n\nWorld");
+    }
+
+    #[test]
+    fn inner_text_differs_from_text_content_for_script_and_style() {
+        let tree = DomTree::new();
+        let doc = tree.document();
+        let div = tree.new_node(NodeData::Element {
+            name: QualName::new(None, ns!(html), local_name!("div")),
+            attrs: vec![],
+            template_contents: None,
+            mathml_annotation_xml_integration_point: false,
+        });
+        tree.append_child(doc, div);
+
+        let script = element(&tree, "script");
+        let script_text = tree.new_node(NodeData::Text { contents: "hidden".into() });
+        tree.append_child(script, script_text);
+        tree.append_child(div, script);
+
+        let visible = tree.new_node(NodeData::Text { contents: "visible".into() });
+        tree.append_child(div, visible);
+
+        assert_eq!(tree.text_content(div), "hiddenvisible");
+        assert_eq!(tree.inner_text(div), "visible");
+    }
+
+    #[test]
     fn test_get_element_by_id() {
         let tree = DomTree::new();
         let doc = tree.document();
@@ -2399,6 +2628,18 @@ mod tests {
         tree.append_child(leaf, marker);
 
         assert_eq!(tree.text_content(root), "deep");
+    }
+
+    #[test]
+    fn test_inner_text_deeply_nested_does_not_overflow() {
+        let tree = DomTree::new();
+        let (root, leaf) = build_deep_chain(&tree, 100_000);
+        let marker = tree.new_node(NodeData::Text {
+            contents: "deep".into(),
+        });
+        tree.append_child(leaf, marker);
+
+        assert_eq!(tree.inner_text(root), "deep");
     }
 
     #[test]

@@ -1818,6 +1818,10 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
             let nid = arg1.parse::<u32>().unwrap_or(0);
             serde_json::to_string(&dom.text_content(NodeId::new(nid))).unwrap_or("\"\"".into())
         }
+        "inner_text" => {
+            let nid = arg1.parse::<u32>().unwrap_or(0);
+            serde_json::to_string(&dom.inner_text(NodeId::new(nid))).unwrap_or("\"\"".into())
+        }
         "parent_node" | "first_child" | "last_child" | "next_sibling" | "prev_sibling" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
             dom.with_node(NodeId::new(nid), |n| match cmd.as_str() {

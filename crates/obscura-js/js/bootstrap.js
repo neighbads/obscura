@@ -3462,7 +3462,12 @@ class Element extends Node {
     }
   }
   get outerHTML() { return _domParse("outer_html", this._nid) ?? ""; }
-  get innerText() { return this.textContent; }
+  // innerText differs from textContent: it skips non-rendered content
+  // (script/style/template/title/noscript) and inserts newlines around
+  // block-level elements, approximating rendered text without a layout
+  // pass. The setter has no such distinction (it just replaces children
+  // with a single text node), so it still delegates to textContent.
+  get innerText() { return _domParse("inner_text", this._nid) ?? ""; }
   set innerText(v) { this.textContent = v; }
   get children() {
     const ids = _domParse("element_children", this._nid) || [];

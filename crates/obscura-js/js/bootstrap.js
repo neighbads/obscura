@@ -2103,6 +2103,35 @@ function __prepareInsertedSubtree(root) {
   for (const script of scripts) __prepareInsertedScript(script);
 }
 
+function __connectCustomElementSubtree(root) {
+  // Custom element reactions: moving a node into a connected tree must fire
+  // connectedCallback for every custom element in that subtree - upgrading it
+  // first if its tag was defined while it was still detached. Without this,
+  // elements created and attached dynamically (the common pattern for
+  // JS-driven UIs such as Polymer/lit) never receive connectedCallback and
+  // stay inert forever; only elements already present when
+  // customElements.define() ran got upgraded.
+  if (!root || !root.isConnected) return;
+  const reg = globalThis.customElements?._registry;
+  if (!reg || !reg.size) return;
+  const els = [];
+  if (root.nodeType === 1) els.push(root);
+  const ids = _domParse("query_selector_all_scoped", root._nid, "*") || [];
+  for (const nid of ids) {
+    const el = _wrapEl(+nid);
+    if (el) els.push(el);
+  }
+  for (const el of els) {
+    const def = reg.get(el.localName);
+    if (!def) continue;
+    if (!el.__customUpgraded) {
+      globalThis.customElements._upgradeElement(el, def);
+    } else if (typeof el.connectedCallback === 'function') {
+      try { el.connectedCallback(); } catch (e) {}
+    }
+  }
+}
+
 function _seedDetachedTreeState(node) {
   node._treeDetachedExact = true;
   node._treeParent = null;
@@ -2260,6 +2289,7 @@ class Node extends EventTarget {
     _registerWindowNamedTree(c);
     if (globalThis.__mutationObservers?.length) globalThis.__notifyMutation('childList', this._nid, [c._nid], []);
     __prepareInsertedSubtree(c);
+    __connectCustomElementSubtree(c);
     if (c instanceof Element && c.tagName === 'LINK') {
       _loadLinkedStylesheet(c);
     }
@@ -2334,6 +2364,7 @@ class Node extends EventTarget {
       globalThis.__notifyMutation('childList', this._nid, [newChild._nid], [oldChild._nid]);
     }
     __prepareInsertedSubtree(newChild);
+    __connectCustomElementSubtree(newChild);
     if (newChild instanceof Element && newChild.tagName === 'LINK') {
       _loadLinkedStylesheet(newChild);
     }
@@ -2371,6 +2402,7 @@ class Node extends EventTarget {
     // observer sees it and whether a <link> loads its stylesheet.
     if (globalThis.__mutationObservers?.length) globalThis.__notifyMutation('childList', this._nid, [n._nid], []);
     __prepareInsertedSubtree(n);
+    __connectCustomElementSubtree(n);
     if (n instanceof Element && n.tagName === 'LINK') {
       _loadLinkedStylesheet(n);
     }
@@ -3538,11 +3570,6 @@ class Element extends Node {
     // throw there aborts the whole module and the SPA renders blank.
     if (!this._relList) this._relList = new DOMTokenList(this, "rel", ["alternate","dns-prefetch","icon","manifest","modulepreload","next","pingback","preconnect","prefetch","preload","prev","search","stylesheet"]);
     return this._relList;
-  }
-  get sandbox() {
-    if (this.namespaceURI !== "http://www.w3.org/1999/xhtml" || this.localName !== "iframe") return undefined;
-    if (!this._sandboxList) this._sandboxList = new DOMTokenList(this, "sandbox", ["allow-downloads","allow-forms","allow-modals","allow-orientation-lock","allow-pointer-lock","allow-popups","allow-popups-to-escape-sandbox","allow-presentation","allow-same-origin","allow-scripts","allow-top-navigation","allow-top-navigation-by-user-activation","allow-top-navigation-to-custom-protocols"]);
-    return this._sandboxList;
   }
   get sizes() {
     if (this.namespaceURI !== "http://www.w3.org/1999/xhtml" || this.localName !== "link") return undefined;
@@ -9546,7 +9573,10 @@ class CustomElementRegistry {
       if (constructed !== el) {
         throw new TypeError("Custom element constructor did not produce the element being upgraded");
       }
-      if (typeof el.connectedCallback === 'function' && globalThis.document?.contains?.(el)) {
+      // isConnected (not document.contains) so elements upgraded inside an
+      // already-connected shadow tree still receive connectedCallback: shadow
+      // trees aren't part of the document tree, so contains() never sees them.
+      if (typeof el.connectedCallback === 'function' && el.isConnected) {
         try { el.connectedCallback(); } catch (e) {}
       }
     } catch (e) {
@@ -12012,7 +12042,20 @@ globalThis.HTMLTextAreaElement = class HTMLTextAreaElement extends HTMLElement {
 };
 globalThis.HTMLLabelElement = class HTMLLabelElement extends HTMLElement {};
 globalThis.HTMLTableElement = class HTMLTableElement extends HTMLElement {};
-globalThis.HTMLIFrameElement = class HTMLIFrameElement extends HTMLElement {};
+globalThis.HTMLIFrameElement = class HTMLIFrameElement extends HTMLElement {
+  // Scoped to HTMLIFrameElement (not the shared HTMLElement base class)
+  // because this is a getter-only accessor: defining it on the base makes
+  // `el.sandbox = x` throw in strict mode for every element, not just real
+  // iframes. The spec marks it `[PutForwards=value] readonly attribute
+  // DOMTokenList sandbox`: assignment is legal and forwards to the returned
+  // DOMTokenList's `.value` (i.e. the reflected attribute), it just can't
+  // rebind the property to a different object.
+  get sandbox() {
+    if (!this._sandboxList) this._sandboxList = new DOMTokenList(this, "sandbox", ["allow-downloads","allow-forms","allow-modals","allow-orientation-lock","allow-pointer-lock","allow-popups","allow-popups-to-escape-sandbox","allow-presentation","allow-same-origin","allow-scripts","allow-top-navigation","allow-top-navigation-by-user-activation","allow-top-navigation-to-custom-protocols"]);
+    return this._sandboxList;
+  }
+  set sandbox(v) { this.sandbox.value = v; }
+};
 // HTMLCanvasElement is defined below (getContext/toDataURL/toBlob support).
 // HTMLVideoElement and HTMLAudioElement are defined above with canPlayType support.
 globalThis.HTMLScriptElement = class HTMLScriptElement extends HTMLElement {};

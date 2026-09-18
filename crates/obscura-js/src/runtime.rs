@@ -6687,6 +6687,95 @@ mod tests {
         );
     }
 
+    /// Regression for R-09 (YouTube frozen on the skeleton screen):
+    /// `connectedCallback` was only ever fired from
+    /// `CustomElementRegistry._upgradeElement`, which itself only ran during
+    /// `customElements.define()`'s batch upgrade of elements already present
+    /// in the document, or at `createElement()` time (always disconnected).
+    /// There was no path that fired `connectedCallback` when a node
+    /// transitioned from disconnected to connected via `appendChild` /
+    /// `insertBefore` / `replaceChild`. Apps that build their component tree
+    /// dynamically (the common pattern for JS-driven UIs such as
+    /// Polymer/lit) never received `connectedCallback` on any of it.
+    #[test]
+    fn custom_element_receives_connected_callback_on_dynamic_append() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"
+                const log = [];
+                class XChild extends HTMLElement {
+                    connectedCallback() { log.push(this.id); }
+                }
+                customElements.define("x-child", XChild);
+
+                const direct = document.createElement("x-child");
+                direct.id = "direct";
+                document.body.appendChild(direct);
+
+                const wrap = document.createElement("div");
+                wrap.innerHTML = '<x-child id="nested"></x-child>';
+                const nested = wrap.firstElementChild;
+                document.body.appendChild(wrap);
+
+                const viaInsertBefore = document.createElement("x-child");
+                viaInsertBefore.id = "inserted";
+                document.body.insertBefore(viaInsertBefore, null);
+
+                return [direct.isConnected, nested.isConnected, log];
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([true, true, ["direct", "nested", "inserted"]])
+        );
+    }
+
+    /// Regression for R-09: `_upgradeElement` gated `connectedCallback` on
+    /// `document.contains(el)`, but shadow trees are not part of the document
+    /// tree in this engine (a shadow root is a separate node graph, linked to
+    /// its host only through a side table), so `contains()` never returns
+    /// true for an element nested inside a shadow root even when the shadow
+    /// host itself is connected. Polymer stamps most of its DOM into shadow
+    /// roots via `importNode` + `appendChild`, so this silently dropped
+    /// `connectedCallback` (and with it, `ready()`) for nearly everything.
+    /// `isConnected` is defined over the composed tree and correctly reports
+    /// true here.
+    #[test]
+    fn custom_element_upgraded_inside_connected_shadow_root_gets_connected_callback() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"
+                const log = [];
+                class YChild extends HTMLElement {
+                    connectedCallback() { log.push("child-connected"); }
+                }
+                customElements.define("y-child", YChild);
+                class XHost extends HTMLElement {
+                    constructor() {
+                        super();
+                        this.attachShadow({ mode: "open" });
+                    }
+                    connectedCallback() {
+                        log.push("host-connected");
+                        const child = document.createElement("y-child");
+                        this.shadowRoot.appendChild(child);
+                    }
+                }
+                customElements.define("x-host", XHost);
+
+                const host = document.createElement("x-host");
+                document.body.appendChild(host);
+
+                return log;
+                "#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!(["host-connected", "child-connected"]));
+    }
+
     #[test]
     fn created_foreign_element_keeps_native_qualified_name_through_clone() {
         let mut rt = setup_runtime("<html><body></body></html>");
@@ -15469,6 +15558,49 @@ mod tests {
             let result = rt.evaluate(&expr).unwrap();
             assert_eq!(result, serde_json::json!(true), "expected true for: {expr}");
         }
+    }
+
+    /// Regression for R-09: `sandbox` used to be a getter-only accessor on
+    /// the shared `Element` base class, so `el.sandbox = x` threw
+    /// `TypeError: Cannot set property sandbox of #<Element> which has only
+    /// a getter` in strict mode for every element, not just iframes. The
+    /// spec marks it `[PutForwards=value] readonly attribute DOMTokenList
+    /// sandbox`, so assignment is legal and forwards to the returned
+    /// DOMTokenList's `.value` (the reflected attribute). Polymer/YouTube's
+    /// iframe-initialization code assigns `iframe.sandbox = "..."` directly
+    /// and its custom-element `connectedCallback` threw on this, so the
+    /// error propagated up and aborted the rest of that element's upgrade.
+    #[test]
+    fn iframe_sandbox_assignment_forwards_to_token_list_value() {
+        let mut rt = setup_runtime(r#"<iframe id="f"></iframe><div id="d"></div>"#);
+        let result = rt
+            .evaluate(
+                r#"
+                const iframe = document.getElementById("f");
+                iframe.sandbox = "allow-scripts allow-same-origin";
+                const div = document.getElementById("d");
+                let divThrew = false;
+                try { div.sandbox = "allow-scripts"; } catch (e) { divThrew = true; }
+                return [
+                    iframe.sandbox.value,
+                    iframe.getAttribute("sandbox"),
+                    iframe.sandbox.contains("allow-scripts"),
+                    div.sandbox,
+                    divThrew,
+                ];
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([
+                "allow-scripts allow-same-origin",
+                "allow-scripts allow-same-origin",
+                true,
+                "allow-scripts",
+                false
+            ])
+        );
     }
 
     /// Regression for #105: `Element.prepend` must actually insert at the

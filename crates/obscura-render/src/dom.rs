@@ -11737,8 +11737,10 @@ enum ContainerAutoBlockSize {
 /// Assign a native control's intrinsic border-box size to its auto axes.
 /// The intrinsic figures are border boxes (Chromium's control metrics), so
 /// a content-box control receives the content part. An authored width or
-/// height keeps winning, as does a grid axis that stretches the item:
-/// only an untouched auto axis adopts the intrinsic value.
+/// height keeps winning. A grid axis that stretches the item keeps `Auto`
+/// so taffy still stretches it, but gets the intrinsic figure as a
+/// `min-height` floor so the grid track's auto sizing does not collapse the
+/// control to zero (see the block below).
 fn assign_native_control_size(
     style: &mut crate::LayoutStyle,
     stretched_grid_item: (bool, bool),
@@ -11757,13 +11759,27 @@ fn assign_native_control_size(
         };
         style.width = crate::Dimension::Px(declared);
     }
-    if style.height == crate::Dimension::Auto && !stretch_block {
+    if style.height == crate::Dimension::Auto {
         let declared = if content_box {
             (intrinsic_height - vertical_edges).max(0.0)
         } else {
             intrinsic_height
         };
-        style.height = crate::Dimension::Px(declared);
+        if !stretch_block {
+            style.height = crate::Dimension::Px(declared);
+        } else if style.min_height == crate::Dimension::Auto {
+            // A stretched grid item still resolves its final height from the
+            // grid track, so `height` must stay Auto for taffy to stretch it.
+            // But a native control leaf has no measure function, so an Auto
+            // height with no children contributes zero to that track's own
+            // auto sizing (Bing's `#sb_form_q`: a `height:auto` textarea
+            // inside a single-row `display:grid` wrapper measured 0 instead
+            // of the ~22px its rows/cols intrinsic size implies). Feed the
+            // intrinsic figure in as a min-height floor instead: it keeps
+            // stretch in control of the final size while giving the track
+            // sizing algorithm a real contribution to size the row from.
+            style.min_height = crate::Dimension::Px(declared);
+        }
     }
 }
 
@@ -21201,5 +21217,45 @@ mod tests {
         let style = &laid.styles[&tree.get_element_by_id("plain").unwrap()];
         assert_eq!(style.display, crate::Display::Inline);
         assert!(style.is_inline_block);
+    }
+
+    /// R-01 (Bing search box measures height:0): a native control with an
+    /// auto block size that is also a stretched grid item (the default
+    /// `align-items` in a single-row `display:grid` wrapper, Bing's own
+    /// `#sb_form_ic`/`#sb_form_q` markup) must still contribute its
+    /// rows/cols-derived intrinsic height to the grid row's auto sizing.
+    /// `assign_native_control_size` used to leave `height` untouched at
+    /// `Auto` whenever the item was classified as stretched, so a leaf
+    /// control with no measure function contributed zero to the track, the
+    /// auto row collapsed to zero, and stretch then stretched the textarea
+    /// to that zero height.
+    #[test]
+    fn stretched_grid_item_textarea_keeps_intrinsic_height_floor() {
+        let html = r#"<!doctype html><style>
+            html, body { margin: 0; font-size: 18px; }
+            #ic { display: grid; padding-top: 14px; }
+            #q { resize: none; overflow: hidden; padding: 0; border: 0; width: 300px; }
+        </style>
+        <div id="ic"><textarea id="q" rows="1"></textarea></div>"#;
+        let tree = parse_html(html);
+        let laid = layout_dom(&tree, (1280.0, 720.0));
+        let q = tree.get_element_by_id("q").unwrap();
+        let ic = tree.get_element_by_id("ic").unwrap();
+        let q_rect = laid.rects[&q];
+        let ic_rect = laid.rects[&ic];
+
+        assert!(
+            q_rect.height > 0.0,
+            "stretched grid textarea must keep a real, non-zero height: {:?}",
+            q_rect
+        );
+        // The row's auto track size must grow to at least the control's own
+        // intrinsic height, so the wrapper (14px padding-top + the track)
+        // is taller than the bare padding alone.
+        assert!(
+            ic_rect.height > 14.0,
+            "grid row must size from the control's intrinsic height, not collapse to padding only: {:?}",
+            ic_rect
+        );
     }
 }

@@ -19014,6 +19014,44 @@ mod tests {
         assert_eq!(inf, serde_json::Value::Null);
     }
 
+    // A framework can rebuild an ancestor wrapper after its child already
+    // exists (React key/portal churn), giving the ancestor a higher `_nid`
+    // than its own descendant even though it was created later. When both
+    // elements' boxes cover the same point, hit testing must still pick the
+    // descendant (the one nothing else is nested in), not whichever element
+    // happens to have the larger `_nid`.
+    #[test]
+    fn test_element_from_point_prefers_nested_descendant_over_higher_nid_ancestor() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let tag = rt
+            .evaluate(
+                "(function() {
+                    var btn = document.createElement('button');
+                    btn.id = 'btn';
+                    document.body.appendChild(btn); // lower _nid
+                    var wrapper = document.createElement('div');
+                    wrapper.id = 'wrapper';
+                    document.body.appendChild(wrapper); // higher _nid, created after
+                    wrapper.appendChild(btn); // ...but wrapper is btn's ancestor
+                    var rect = {
+                        x: 0, y: 0, width: 100, height: 50,
+                        top: 0, left: 0, right: 100, bottom: 50,
+                        toJSON() { return this; },
+                    };
+                    wrapper.getBoundingClientRect = function() { return rect; };
+                    btn.getBoundingClientRect = function() { return rect; };
+                    return document.elementFromPoint(10, 10).tagName;
+                })()",
+            )
+            .unwrap();
+        assert_eq!(
+            tag,
+            serde_json::json!("BUTTON"),
+            "the deepest element under the point must win hit testing, not whichever \
+             overlapping ancestor happens to have a larger _nid"
+        );
+    }
+
     fn spawn_one_response_server(status: &str, body: &str) -> String {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();

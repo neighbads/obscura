@@ -15457,8 +15457,18 @@ if (typeof Document !== 'undefined' && !Document.prototype.elementFromPoint) {
   // don't form a proper containment hierarchy (a child's rect can lie far
   // outside its parent's), so a tree walk that only descends into ancestors
   // containing (x,y) would never reach a deep <input> inside <label><p>.
-  // Returns the deepest matching element (highest nid wins as a proxy for
-  // tree depth) so descendants beat ancestors.
+  //
+  // Among the elements whose box contains (x, y), the correct hit is the
+  // most-nested one (the one none of the other candidates are nested in),
+  // decided by real DOM containment (Node.contains) — not by `_nid`. `_nid`
+  // is assignment order, which is only a proxy for tree depth when nodes are
+  // created top-down and never touched again; a framework that rebuilds an
+  // ancestor wrapper after its children exist (common with React key/portal
+  // churn) gives that ancestor a higher `_nid` than its own descendants,
+  // so the old "highest nid wins" rule could return the wrapper instead of
+  // the deepest element under the point — e.g. resolving a click on a
+  // <button> to its outer container div, so the button's default action
+  // (like form submission) never runs (issue: SPA click-driven steps stall).
   Document.prototype.elementFromPoint = function(x, y) {
     if (typeof x !== 'number' || typeof y !== 'number' || !isFinite(x) || !isFinite(y)) {
       return null;
@@ -15467,8 +15477,7 @@ if (typeof Document !== 'undefined' && !Document.prototype.elementFromPoint) {
     var h = (typeof window !== 'undefined' && window.innerHeight) || 720;
     if (x < 0 || y < 0 || x > w || y > h) return null;
     var all = this.querySelectorAll('*');
-    var best = null;
-    var bestNid = -1;
+    var candidates = [];
     for (var i = 0; i < all.length; i++) {
       var el = all[i];
       if (!el || !el.getBoundingClientRect) continue;
@@ -15478,6 +15487,15 @@ if (typeof Document !== 'undefined' && !Document.prototype.elementFromPoint) {
       var r = el.getBoundingClientRect();
       if (r.width === 0 || r.height === 0) continue;
       if (x >= r.left && x <= r.right && y >= r.top && y <= r.bottom) {
+        // Elements invisible to hit testing per spec must not win, the same
+        // way a real browser skips them: display:none already fails the
+        // zero-size check above, but visibility:hidden and pointer-events:
+        // none still report a real rect and must be filtered here.
+        var ownStyle = null;
+        try { ownStyle = getComputedStyle(el); } catch (_e) {}
+        if (ownStyle && (ownStyle.visibility === 'hidden' || ownStyle.pointerEvents === 'none')) {
+          continue;
+        }
         // A descendant's layout rect can extend beyond an overflow clip. It
         // must not win hit testing where its scrolling ancestor hides it —
         // otherwise a wheel well outside a small pane scrolls that pane
@@ -15511,9 +15529,19 @@ if (typeof Document !== 'undefined' && !Document.prototype.elementFromPoint) {
           ancestor = ancestor.parentElement;
         }
         if (!visible) continue;
-        var nid = el._nid | 0;
-        if (nid > bestNid) { best = el; bestNid = nid; }
+        candidates.push(el);
       }
+    }
+    // The correct hit is whichever candidate is not an ancestor of any other
+    // candidate — i.e. the most-nested one actually under the point.
+    var best = null;
+    for (var j = 0; j < candidates.length; j++) {
+      var c = candidates[j];
+      var isAncestorOfOther = false;
+      for (var k = 0; k < candidates.length; k++) {
+        if (k !== j && c.contains(candidates[k])) { isAncestorOfOther = true; break; }
+      }
+      if (!isAncestorOfOther) { best = c; break; }
     }
     return best || this.body || this.documentElement || null;
   };

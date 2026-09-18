@@ -236,10 +236,21 @@ pub async fn handle(
             let node_id = resolve_node_id(page, params)?;
             // Obscura has no layout viewport to move, but the JS shim records
             // this element for the hit testing used by subsequent input events.
+            //
+            // `el.scrollIntoView()` with no arguments defaults to block:"start",
+            // which unconditionally re-aligns the element to the top of the
+            // viewport even when it is already fully visible. That's wrong for
+            // "IfNeeded" semantics: it can shove an already-visible element
+            // under a fixed/sticky header, causing the subsequent click's
+            // hit-test to land on the header instead of the target (issue: a
+            // click-driven form never advances because the real target ends up
+            // obscured). block/inline:"nearest" only moves the viewport when
+            // the element isn't already fully in view, matching real browsers'
+            // scrollIntoViewIfNeeded.
             let code = format!(
                 "(function() {{ var el = globalThis._wrap && globalThis._wrap({0}); \
                  if (!el || typeof el.scrollIntoView !== 'function') return false; \
-                 el.scrollIntoView(); return true; }})()",
+                 el.scrollIntoView({{block:'nearest',inline:'nearest'}}); return true; }})()",
                 node_id
             );
             let did_scroll = page.evaluate(&code).as_bool().unwrap_or(false);
@@ -793,6 +804,135 @@ mod tests {
         assert_eq!(
             error,
             "node 999999 could not be resolved to a scrollable element"
+        );
+    }
+
+    // issue: DOM.scrollIntoViewIfNeeded called el.scrollIntoView() with no
+    // arguments, which defaults to block:"start" and unconditionally scrolls
+    // the element to the top of the viewport -- even when it was already
+    // fully visible. That could shove an on-screen element under a fixed
+    // header, so a later click-by-coordinate misses it entirely.
+    #[tokio::test(flavor = "current_thread")]
+    async fn scroll_into_view_if_needed_does_not_move_an_already_visible_element() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session = Some(format!("{page_id}-session"));
+        ctx.sessions.insert(session.clone().unwrap(), page_id);
+
+        crate::domains::page::handle(
+            "navigate",
+            &json!({
+                "url": "data:text/html,<body style='margin:0;height:3000px'>\
+                    <button id=target style='position:absolute;top:10px;left:10px'>Go</button>\
+                    </body>",
+                "waitUntil": "load"
+            }),
+            &mut ctx,
+            &session,
+        )
+        .await
+        .expect("navigate should succeed");
+
+        let query = handle(
+            "querySelector",
+            &json!({ "selector": "#target" }),
+            &mut ctx,
+            &session,
+        )
+        .await
+        .expect("querySelector should succeed");
+        let node_id = query["nodeId"].as_u64().expect("button nodeId");
+
+        handle(
+            "scrollIntoViewIfNeeded",
+            &json!({ "nodeId": node_id }),
+            &mut ctx,
+            &session,
+        )
+        .await
+        .expect("scrollIntoViewIfNeeded should succeed");
+
+        let scroll_y = ctx
+            .get_session_page_mut(&session)
+            .unwrap()
+            .evaluate("window.scrollY")
+            .as_f64()
+            .expect("scrollY should be a number");
+        assert_eq!(
+            scroll_y, 0.0,
+            "an element already fully in view must not be scrolled"
+        );
+    }
+
+    // Companion regression test: an element that genuinely is off-screen must
+    // still be scrolled into view (the fix must not turn this into a no-op).
+    // The test build has no layout engine, so getBoundingClientRect() always
+    // reports the same stub rect (top:190, height:20); shrink the viewport
+    // below that via Emulation.setDeviceMetricsOverride so the stub rect is
+    // genuinely out of view.
+    #[tokio::test(flavor = "current_thread")]
+    async fn scroll_into_view_if_needed_scrolls_an_offscreen_element() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session = Some(format!("{page_id}-session"));
+        ctx.sessions.insert(session.clone().unwrap(), page_id);
+
+        crate::domains::page::handle(
+            "navigate",
+            &json!({
+                "url": "data:text/html,<body style='margin:0;height:2000px'>\
+                    <button id=target>Go</button>\
+                    </body>",
+                "waitUntil": "load"
+            }),
+            &mut ctx,
+            &session,
+        )
+        .await
+        .expect("navigate should succeed");
+
+        crate::domains::emulation::handle(
+            "setDeviceMetricsOverride",
+            &json!({
+                "width": 320,
+                "height": 100,
+                "deviceScaleFactor": 1,
+                "mobile": false
+            }),
+            &mut ctx,
+            &session,
+        )
+        .await
+        .expect("setDeviceMetricsOverride should succeed");
+
+        let query = handle(
+            "querySelector",
+            &json!({ "selector": "#target" }),
+            &mut ctx,
+            &session,
+        )
+        .await
+        .expect("querySelector should succeed");
+        let node_id = query["nodeId"].as_u64().expect("button nodeId");
+
+        handle(
+            "scrollIntoViewIfNeeded",
+            &json!({ "nodeId": node_id }),
+            &mut ctx,
+            &session,
+        )
+        .await
+        .expect("scrollIntoViewIfNeeded should succeed");
+
+        let scroll_y = ctx
+            .get_session_page_mut(&session)
+            .unwrap()
+            .evaluate("window.scrollY")
+            .as_f64()
+            .expect("scrollY should be a number");
+        assert!(
+            scroll_y > 0.0,
+            "an off-screen element must still be scrolled into view, got scrollY={scroll_y}"
         );
     }
 

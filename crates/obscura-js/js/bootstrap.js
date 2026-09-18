@@ -9544,10 +9544,24 @@ class CustomElementRegistry {
     if (this._registry.has(name)) throw new DOMException("Failed to execute 'define' on 'CustomElementRegistry': the name \"" + name + "\" has already been used with this registry", "NotSupportedError");
     if (this._byCtor.has(cls)) throw new DOMException("Failed to execute 'define' on 'CustomElementRegistry': the constructor has already been used with this registry", "NotSupportedError");
     this._defining = true;
-    try { this._byCtor.set(cls, name); this._defineInner(name, cls, opts); } finally { this._defining = false; }
+    try { this._byCtor.set(cls, name); this._registry.set(name, cls); } finally { this._defining = false; }
+    // Per spec, the "element definition is running" flag is unset before the
+    // upgrade reactions for matching elements actually run (it only guards
+    // registering the definition and enqueueing those reactions). Upgrading
+    // here, after the flag is cleared, lets a candidate's constructor call
+    // customElements.define() for another name - a routine pattern for
+    // Polymer/Templatize's lazily-defined helper elements - without hitting
+    // the reentrancy guard above. Doing the upgrade while still "defining"
+    // made that reentrant define() throw inside the element's own
+    // constructor, with no page script above it to catch the error - so the
+    // constructor was cut short (property accessor setup, template
+    // stamping, ready() never ran) while _upgradeElement still marked the
+    // element __customUpgraded and still fired connectedCallback. The
+    // element looked upgraded and connected but its template bindings
+    // ([[...]]) were never evaluated.
+    this._defineInner(name, cls);
   }
-  _defineInner(name, cls, opts) {
-    this._registry.set(name, cls);
+  _defineInner(name, cls) {
     // Upgrade existing matching elements: instantiate the class on each,
     // fire connectedCallback if the element is in the document. Without
     // this, lit / MusicKit / Polymer components never wire up their

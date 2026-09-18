@@ -6732,6 +6732,63 @@ mod tests {
         );
     }
 
+    /// Regression for R-09 (YouTube's home page stuck with Polymer's
+    /// `[[expr]]` template bindings rendered as raw, unevaluated text):
+    /// `CustomElementRegistry.define()` held `_defining` for its entire
+    /// call, including the synchronous upgrade of every pre-existing
+    /// matching element performed by `_defineInner`. Per spec, the
+    /// "element definition is running" flag is only held while registering
+    /// the definition and enqueueing upgrade reactions - it is released
+    /// before those reactions (the matched elements' constructors) run.
+    /// Real Polymer code relies on this: `Templatize`/lazily-defined helper
+    /// elements routinely call `customElements.define()` for another name
+    /// from inside a constructor that itself is running as part of another
+    /// element's upgrade. With the flag held too long, that nested
+    /// `define()` call hit the reentrancy guard and threw, aborting the
+    /// outer element's constructor partway through - so `_upgradeElement`
+    /// still marked it `__customUpgraded` (that flag is set before
+    /// construction even starts) and, if already connected, still fired
+    /// `connectedCallback`, but the rest of the constructor (property
+    /// accessor setup, template stamping, `ready()`) never ran. The element
+    /// looked "upgraded" and "connected" while never producing any of its
+    /// bound output.
+    #[test]
+    fn nested_custom_element_define_during_upgrade_does_not_abort_outer_constructor() {
+        let mut rt = setup_runtime("<html><body><r09-outer></r09-outer></body></html>");
+        let result = rt
+            .evaluate(
+                r#"
+                const log = [];
+                class Inner extends HTMLElement {}
+                class Outer extends HTMLElement {
+                    constructor() {
+                        super();
+                        // <r09-outer> is already in the document, so defining
+                        // it below synchronously upgrades (constructs) this
+                        // element as part of that define() call. A real
+                        // Polymer helper-element define from here must not
+                        // throw and must not stop the rest of this
+                        // constructor from running.
+                        customElements.define("r09-inner", Inner);
+                        log.push("inner-defined");
+                        this._ready = true;
+                    }
+                }
+                customElements.define("r09-outer", Outer);
+
+                const outer = document.querySelector("r09-outer");
+                return [
+                    log,
+                    !!customElements.get("r09-inner"),
+                    outer.__customUpgraded,
+                    outer._ready,
+                ];
+                "#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!([["inner-defined"], true, true, true]));
+    }
+
     /// Regression for R-09: `_upgradeElement` gated `connectedCallback` on
     /// `document.contains(el)`, but shadow trees are not part of the document
     /// tree in this engine (a shadow root is a separate node graph, linked to

@@ -21168,6 +21168,81 @@ mod tests {
         assert_eq!(result, serde_json::json!("src"));
     }
 
+    // https://dom.spec.whatwg.org/#dom-mutationobserver-observe step 1: if
+    // attributeOldValue or attributeFilter is present and attributes is not,
+    // attributes is implied true. Before this fix observe() passed options
+    // straight through, so `{ attributeFilter: ['src'] }` left `attributes`
+    // undefined and every attribute mutation was silently dropped, even
+    // though pages commonly omit `attributes: true` when they set a filter.
+    #[test]
+    fn observe_implies_attributes_from_attribute_filter() {
+        let mut rt = setup_runtime("<html><body><div id=\"el\"></div></body></html>");
+        let result = rt
+            .evaluate(
+                r#"
+                var scriptTestSetup = true;
+                const records = [];
+                const observer = new MutationObserver((batch) => records.push(...batch));
+                observer.observe(document.getElementById('el'), { attributeFilter: ['src'] });
+                document.getElementById('el').setAttribute('src', 'b.png');
+                records.push(...observer.takeRecords());
+                observer.disconnect();
+                return [records.length, records[0] && records[0].attributeName];
+                "#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!([1, "src"]));
+    }
+
+    // Step 3: if none of childList/attributes/characterData ends up true,
+    // observe() must throw a TypeError instead of silently registering a
+    // no-op observer.
+    #[test]
+    fn observe_with_empty_options_throws_type_error() {
+        let mut rt = setup_runtime("<html><body><p id=\"a\"></p></body></html>");
+        let result = rt
+            .evaluate(
+                r#"
+                var scriptTestSetup = true;
+                let threw = false;
+                try {
+                  new MutationObserver(() => {}).observe(document.getElementById('a'), {});
+                } catch (error) {
+                  threw = error instanceof TypeError;
+                }
+                return threw;
+                "#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!(true));
+    }
+
+    // Step 5: attributeFilter present but attributes explicitly false must
+    // throw, not get silently upgraded to true the way an absent attributes
+    // key does in step 1.
+    #[test]
+    fn observe_with_attribute_filter_and_attributes_false_throws_type_error() {
+        let mut rt = setup_runtime("<html><body><p id=\"a\"></p></body></html>");
+        let result = rt
+            .evaluate(
+                r#"
+                var scriptTestSetup = true;
+                let threw = false;
+                try {
+                  new MutationObserver(() => {}).observe(document.getElementById('a'), {
+                    attributes: false,
+                    attributeFilter: ['src'],
+                  });
+                } catch (error) {
+                  threw = error instanceof TypeError;
+                }
+                return threw;
+                "#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!(true));
+    }
+
     #[test]
     fn document_write_registers_window_named_access() {
         let mut rt = setup_runtime("<html><body></body></html>");

@@ -9359,7 +9359,37 @@ globalThis.MutationObserver = class MutationObserver {
     this._records = [];
   }
   observe(target, options) {
-    this._targets.push({ target, options: options || {} });
+    // https://dom.spec.whatwg.org/#dom-mutationobserver-observe
+    // Steps 1-6: normalize implied booleans, then validate the resulting
+    // options. "exists" means the key is present on the dict, not that its
+    // value is truthy, so we check with `in` before falling back to the
+    // caller's value.
+    const opts = Object.assign({}, options);
+    // Step 1.
+    if (('attributeOldValue' in opts || 'attributeFilter' in opts) && !('attributes' in opts)) {
+      opts.attributes = true;
+    }
+    // Step 2.
+    if ('characterDataOldValue' in opts && !('characterData' in opts)) {
+      opts.characterData = true;
+    }
+    // Step 3.
+    if (!opts.childList && !opts.attributes && !opts.characterData) {
+      throw new TypeError("Failed to execute 'observe' on 'MutationObserver': The options object must set at least one of 'attributes', 'characterData', or 'childList' to true.");
+    }
+    // Step 4.
+    if (opts.attributeOldValue && !opts.attributes) {
+      throw new TypeError("Failed to execute 'observe' on 'MutationObserver': The options object may only set 'attributeOldValue' to true when 'attributes' is true or not present.");
+    }
+    // Step 5.
+    if ('attributeFilter' in opts && !opts.attributes) {
+      throw new TypeError("Failed to execute 'observe' on 'MutationObserver': The options object may only set 'attributeFilter' when 'attributes' is true or not present.");
+    }
+    // Step 6.
+    if (opts.characterDataOldValue && !opts.characterData) {
+      throw new TypeError("Failed to execute 'observe' on 'MutationObserver': The options object may only set 'characterDataOldValue' to true when 'characterData' is true or not present.");
+    }
+    this._targets.push({ target, options: opts });
     globalThis.__mutationObservers.push(this);
   }
   disconnect() {

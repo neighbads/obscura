@@ -15384,6 +15384,33 @@ mod tests {
         assert_eq!(is_form, serde_json::json!(true));
     }
 
+    /// Regression for the GitLab signup page: webpack's style-loader runtime
+    /// checks `target instanceof window.HTMLIFrameElement` to redirect style
+    /// insertion into an iframe's `contentDocument`. `HTMLIFrameElement` used
+    /// to alias the generic `Element` class, so every element (e.g. `<head>`)
+    /// satisfied that check, sending style-loader into
+    /// `target.contentDocument.head` (`undefined.head`, since a non-iframe's
+    /// `contentDocument` getter returns `undefined`), which throws and gets
+    /// swallowed by style-loader's own try/catch, permanently caching a null
+    /// insertion target and breaking every later style insertion (and thus
+    /// hydration) on the page.
+    #[test]
+    fn html_iframe_element_instanceof_is_iframe_specific() {
+        let mut rt = setup_runtime(r#"<iframe id="f"></iframe><div id="d"></div>"#);
+        let iframe_is_iframe = rt
+            .evaluate("document.getElementById('f') instanceof HTMLIFrameElement")
+            .unwrap();
+        assert_eq!(iframe_is_iframe, serde_json::json!(true));
+        let div_is_iframe = rt
+            .evaluate("document.getElementById('d') instanceof HTMLIFrameElement")
+            .unwrap();
+        assert_eq!(div_is_iframe, serde_json::json!(false));
+        let head_is_iframe = rt
+            .evaluate("document.head instanceof HTMLIFrameElement")
+            .unwrap();
+        assert_eq!(head_is_iframe, serde_json::json!(false));
+    }
+
     /// Regression for #105: `Element.prepend` must actually insert at the
     /// start, not silently no-op.
     #[test]

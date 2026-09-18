@@ -6625,6 +6625,7 @@ function _elementClassFor(nid) {
   if (tag === "AUDIO") return HTMLAudioElement;
   if (tag === "VIDEO") return HTMLVideoElement;
   if (tag === "TRACK") return HTMLTrackElement;
+  if (tag === "IFRAME" && globalThis.HTMLIFrameElement) return globalThis.HTMLIFrameElement;
   return Element;
 }
 function _elementClassForKnownName(namespace, qualifiedName) {
@@ -6646,6 +6647,7 @@ function _elementClassForKnownName(namespace, qualifiedName) {
     if (tag === "AUDIO") return HTMLAudioElement;
     if (tag === "VIDEO") return HTMLVideoElement;
     if (tag === "TRACK") return HTMLTrackElement;
+    if (tag === "IFRAME" && globalThis.HTMLIFrameElement) return globalThis.HTMLIFrameElement;
   }
   return Element;
 }
@@ -11968,7 +11970,7 @@ globalThis.HTMLTextAreaElement = class HTMLTextAreaElement extends Element {
 };
 globalThis.HTMLLabelElement = Element;
 globalThis.HTMLTableElement = Element;
-globalThis.HTMLIFrameElement = Element;
+globalThis.HTMLIFrameElement = class HTMLIFrameElement extends Element {};
 globalThis.HTMLCanvasElement = Element;
 // HTMLVideoElement and HTMLAudioElement are defined above with canPlayType support.
 globalThis.HTMLScriptElement = Element;

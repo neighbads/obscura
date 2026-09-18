@@ -4531,7 +4531,7 @@ fn paint_laid_dom_scrolled(
                                 12.0,
                                 true,
                                 style,
-                                clip,
+                                Some(visible_rect),
                                 element_clip_mask,
                                 raster_scale,
                             );
@@ -12534,6 +12534,23 @@ mod tests {
         assert_eq!(decoded.width(), 1);
         assert_eq!(decoded.height(), 1);
         assert_eq!(decoded.pixel(0, 0).expect("pixel").alpha(), 255);
+
+        // Known gap: the `gif` crate (via `image::load_from_memory`) requires a
+        // global or local color table per GIF89a and errors out on frames that
+        // have neither, even though real browsers tolerate this and treat such
+        // frames as fully transparent. TRANSPARENT_GIF intentionally omits both
+        // tables (mirroring Apple's lazy-load placeholder), so raster_to_pixmap
+        // currently fails to decode it and paint_image falls back to painting
+        // alt text instead. That fallback path's clipping is fixed elsewhere in
+        // this file; fixing the decode itself would require bypassing the
+        // `image`/`gif` crates' spec-strict color-table requirement, which is
+        // out of scope here. This assertion documents the gap so it is caught
+        // if crate behavior changes.
+        assert!(
+            raster_to_pixmap(TRANSPARENT_GIF, 1, 1).is_none(),
+            "raster_to_pixmap unexpectedly decoded a palette-less GIF; the alt-text \
+             fallback path may no longer be exercised by this fixture"
+        );
     }
 
     #[test]

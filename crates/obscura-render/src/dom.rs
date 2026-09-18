@@ -13766,9 +13766,8 @@ fn estimate_float_height(
         .map(|id| {
             styles
                 .get(&id)
-                .and_then(|style| style.font_size)
-                .unwrap_or(16.0)
-                * 1.2
+                .map(crate::inline::used_line_height)
+                .unwrap_or(16.0 * 1.2)
         })
         .sum();
     (image_height + text_height + structural_height).max(DEFAULT_FLOAT_HEIGHT_ESTIMATE)
@@ -13793,11 +13792,22 @@ fn estimate_text_height(
     if char_count == 0.0 {
         return 0.0;
     }
-    let fsize = styles.get(&id).and_then(|s| s.font_size).unwrap_or(16.0);
+    let style = styles.get(&id);
+    let fsize = style.and_then(|s| s.font_size).unwrap_or(16.0);
+    // A used line-height of 1.5 (common in real prose, e.g. Wikipedia's body
+    // copy) is 25% taller than the `1.2` this used to assume unconditionally.
+    // Underestimating per-line height here compounds across every paragraph
+    // in the float zone below and can leave the zone-growing loop in
+    // `build_children_with_float_zone` extending past the float's real
+    // bottom, sweeping a paragraph that is actually clear of the float into
+    // the narrowed column alongside it.
+    let line_height = style
+        .map(crate::inline::used_line_height)
+        .unwrap_or(fsize * 1.2);
     const AVG_CHAR_WIDTH_EM: f32 = 0.55;
     let chars_per_line = (assumed_width / (fsize * AVG_CHAR_WIDTH_EM)).max(1.0);
     let lines = (char_count / chars_per_line).ceil().max(1.0);
-    lines * fsize * 1.2 + 16.0
+    lines * line_height + 16.0
 }
 
 /// Estimate the normal-flow height consumed by one sibling alongside a float.
@@ -17053,6 +17063,76 @@ mod tests {
             "reused #target must resize to content like a full recompute: {:?} vs {:?}",
             incremental.rects[&target],
             full.rects[&full_target]
+        );
+    }
+
+    /// R-04 (Wikipedia article body collapses to a narrow column once a
+    /// multi-paragraph flow follows a float): `build_children_with_float_zone`
+    /// decides how many flow siblings following a float are still beside it
+    /// (and so must be narrowed) by accumulating `estimate_flow_sibling_height`
+    /// for each candidate until the running total reaches the float's own
+    /// estimated height. That estimate used to compute each line's height as
+    /// a flat `font_size * 1.2`, ignoring the element's actual CSS
+    /// `line-height`. Real prose commonly sets `line-height: 1.5` (25% taller
+    /// per line), so across several real paragraphs the estimate falls
+    /// increasingly short of their real, narrower-column height, and the
+    /// zone-growing loop keeps sweeping in one paragraph too many — including
+    /// one that is genuinely clear of the float and should render at the
+    /// full container width. A 2-paragraph fixture does not accumulate enough
+    /// drift to show this; it takes several real paragraphs, matching this
+    /// repro (adapted from the audit's `repro/r04-float-text.html`, itself
+    /// bisected from the real Wikipedia Rust article).
+    #[test]
+    fn float_zone_paragraph_below_float_bottom_keeps_full_width() {
+        let html = r#"<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>float + long text below</title>
+<style>
+  html, body { margin: 0; font: 16px/1.5 arial, sans-serif; }
+  #bfc { width: 752px; }
+  #infobox {
+    float: right;
+    width: 300px;
+    height: 400px;
+    background: #ccc;
+    border: 2px solid #333;
+  }
+  p { margin: 0 0 1em 0; }
+</style>
+</head>
+<body>
+  <main id="bfc">
+    <h1>Heading</h1>
+    <aside id="infobox"></aside>
+    <p id=p1>Rust is a general-purpose programming language emphasizing performance, type safety, and concurrency. It enforces memory safety, meaning all references point to valid memory.</p>
+    <p id=p2>Its syntax is similar to that of C++, but Rust also provides memory safety without using garbage collection.</p>
+    <p id=p3>Software developer Graydon Hoare created Rust in 2006 while working at Mozilla, which officially sponsored the project in 2009. The first stable release, Rust 1.0, was published in May 2015. The project has been sponsored by the Rust Foundation since February 2021.</p>
+    <p id=p4>Rust has been influenced by a wide range of programming languages and ideas, including functional programming, imperative programming and systems programming approaches, drawing inspiration from prior research and industrial languages alike.</p>
+    <p id=p5>This final paragraph sits well below the bottom of the floated infobox and should render at the full 752px content width, matching Chromium, rather than being squeezed down to a min-content column.</p>
+  </main>
+</body>
+</html>"#;
+        let tree = parse_html(html);
+        let layout = layout_dom(&tree, (800.0, 4000.0));
+        let infobox = tree.get_element_by_id("infobox").unwrap();
+        let infobox_rect = layout.rects[&infobox];
+        let p5 = tree.get_element_by_id("p5").unwrap();
+        let p5_rect = layout.rects[&p5];
+
+        // Sanity check on the premise: p5 must actually start below the
+        // float's bottom edge, or this fixture no longer exercises the bug.
+        assert!(
+            p5_rect.y >= infobox_rect.y + infobox_rect.height,
+            "fixture premise broken: #p5 must start below #infobox's bottom edge: {:?} vs {:?}",
+            p5_rect,
+            infobox_rect
+        );
+        assert_eq!(
+            p5_rect.width, 752.0,
+            "#p5 is clear of the float and must render at the full container width, not be swept into the narrowed float zone: {:?}",
+            p5_rect
         );
     }
 

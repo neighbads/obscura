@@ -8557,23 +8557,35 @@ fn parse_background_position(value: &str) -> crate::BackgroundPosition {
     }
 }
 
-/// Parse a `box-shadow` value into its first layer:
-/// `[inset]? <offset-x> <offset-y> <blur>? <spread>? <color>?`. The `inset`
-/// keyword and the color may each lead or trail the lengths; comma-separated
-/// multiples are accepted but only the first layer is stored. `current_color`
-/// supplies the default when the color is omitted (CSS `currentColor`).
+/// Parse a `box-shadow` value into its layers, in declaration order (CSS
+/// stacks the first-declared layer on top). Each comma-separated layer is
+/// `[inset]? <offset-x> <offset-y> <blur>? <spread>? <color>?`; the `inset`
+/// keyword and the color may each lead or trail the lengths. `current_color`
+/// supplies the default when a layer's color is omitted (CSS `currentColor`).
+/// A layer that fails to parse (fewer than two lengths) is dropped rather than
+/// discarding the whole declaration.
 fn parse_box_shadow(
     value: &str,
     current_color: Option<[u8; 4]>,
     dark_scheme: bool,
-) -> Option<crate::BoxShadow> {
+) -> Vec<crate::BoxShadow> {
     let v = value.trim();
     if v.is_empty() || v.eq_ignore_ascii_case("none") {
-        return None;
+        return Vec::new();
     }
-    // Only the first comma-separated layer is modeled; split at paren depth 0 so
-    // the commas inside an rgba()/hsl() color are not treated as separators.
-    let layer = split_top_level(v, ',').into_iter().next()?;
+    // Split at paren depth 0 so the commas inside an rgba()/hsl() color are
+    // not treated as layer separators.
+    split_top_level(v, ',')
+        .into_iter()
+        .filter_map(|layer| parse_box_shadow_layer(layer, current_color, dark_scheme))
+        .collect()
+}
+
+fn parse_box_shadow_layer(
+    layer: &str,
+    current_color: Option<[u8; 4]>,
+    dark_scheme: bool,
+) -> Option<crate::BoxShadow> {
     let mut inset = false;
     let mut color: Option<[u8; 4]> = None;
     let mut lengths: Vec<f32> = Vec::new();
@@ -10967,7 +10979,8 @@ mod tests {
     #[test]
     fn box_shadow_outset_parses() {
         let s = compute_style("div", Some("box-shadow: 0 2px 8px rgba(0,0,0,.15)"));
-        let sh = s.box_shadow.expect("box-shadow parsed");
+        assert_eq!(s.box_shadow.len(), 1);
+        let sh = s.box_shadow[0];
         assert!(!sh.inset);
         assert_eq!(sh.offset_x, 0.0);
         assert_eq!(sh.offset_y, 2.0);
@@ -10979,7 +10992,8 @@ mod tests {
     #[test]
     fn box_shadow_inset_parses() {
         let s = compute_style("div", Some("box-shadow: inset 0 0 0 1px #ccc"));
-        let sh = s.box_shadow.expect("box-shadow parsed");
+        assert_eq!(s.box_shadow.len(), 1);
+        let sh = s.box_shadow[0];
         assert!(sh.inset);
         assert_eq!(sh.offset_x, 0.0);
         assert_eq!(sh.offset_y, 0.0);
@@ -10992,13 +11006,33 @@ mod tests {
     fn box_shadow_color_defaults_to_current_color() {
         // No explicit color: falls back to the element's text color.
         let s = compute_style("div", Some("color: red; box-shadow: 1px 1px 2px"));
-        let sh = s.box_shadow.expect("box-shadow parsed");
-        assert_eq!(sh.color, [255, 0, 0, 255]);
+        assert_eq!(s.box_shadow.len(), 1);
+        assert_eq!(s.box_shadow[0].color, [255, 0, 0, 255]);
     }
 
     #[test]
     fn box_shadow_none_clears() {
         let s = compute_style("div", Some("box-shadow: none"));
-        assert!(s.box_shadow.is_none());
+        assert!(s.box_shadow.is_empty());
+    }
+
+    #[test]
+    fn box_shadow_multiple_layers_all_parse_in_declaration_order() {
+        // Tailwind v4 composes multiple `--tw-shadow` layers via CSS variables
+        // into one comma-separated `box-shadow` value, with the visually
+        // significant layer declared last. All layers must survive parsing,
+        // in the order they were declared, or trailing layers (often the only
+        // visible one) are silently dropped.
+        let s = compute_style(
+            "div",
+            Some("box-shadow: 0 1px 0 red, 0 2px 0 blue, 0 3px 0 green"),
+        );
+        assert_eq!(s.box_shadow.len(), 3);
+        assert_eq!(s.box_shadow[0].offset_y, 1.0);
+        assert_eq!(s.box_shadow[0].color, [255, 0, 0, 255]);
+        assert_eq!(s.box_shadow[1].offset_y, 2.0);
+        assert_eq!(s.box_shadow[1].color, [0, 0, 255, 255]);
+        assert_eq!(s.box_shadow[2].offset_y, 3.0);
+        assert_eq!(s.box_shadow[2].color, [0, 128, 0, 255]);
     }
 }

@@ -3121,7 +3121,7 @@ fn native_raster_scale_supported(tree: &DomTree, laid: &crate::DomLayout) -> boo
             && style.mask_image.is_none()
             && gradients_supported
             && !style.background_clip_text
-            && style.box_shadow.is_none()
+            && style.box_shadow.is_empty()
             && style.content_image.is_none()
             && style.text_overflow == crate::TextOverflow::Clip;
         simple
@@ -4161,7 +4161,7 @@ fn paint_laid_dom_scrolled(
                 || style.background_radial_gradient.is_some()
                 || style.background_conic_gradient.is_some()
                 || !style.background_gradient_layers.is_empty());
-        let has_inline_box_paint = style.box_shadow.is_some()
+        let has_inline_box_paint = !style.box_shadow.is_empty()
             || has_background_box_paint
             || style.border != crate::Edges::default();
         let inline_pieces = (style.ignores_used_box_sizes() && has_inline_box_paint)
@@ -4190,10 +4190,12 @@ fn paint_laid_dom_scrolled(
         // ancestor overflow clip is reapplied inside so the shadow is clipped by
         // an ancestor exactly as the box itself is.
         if !paints_inline_fragments {
-            if let Some(shadow) = style.box_shadow {
+            // Declaration order stacks the first layer on top, so paint later
+            // layers first and the first layer last.
+            for shadow in style.box_shadow.iter().filter(|s| !s.inset).rev() {
                 paint_box_shadow(
                     &mut pixmap,
-                    &shadow,
+                    shadow,
                     &rect,
                     style.border_model.radii,
                     ancestor_clip_mask.as_deref(),
@@ -4461,6 +4463,17 @@ fn paint_laid_dom_scrolled(
         }
 
         if !paints_inline_fragments {
+            // Inset shadows paint above the background but below the border.
+            for shadow in style.box_shadow.iter().filter(|s| s.inset).rev() {
+                paint_inset_box_shadow(
+                    &mut pixmap,
+                    shadow,
+                    &rect,
+                    style.border,
+                    style.border_model.radii,
+                    ancestor_clip_mask.as_deref(),
+                );
+            }
             paint_css_border(
                 &mut pixmap,
                 &rect,
@@ -5011,8 +5024,9 @@ fn rect_intersects_paint_surface(
 /// the box itself remains outside it.
 fn non_text_ink_bounds(rect: &crate::Rect, style: &crate::LayoutStyle) -> crate::Rect {
     let mut bounds = *rect;
-    if let Some(shadow) = style
+    for shadow in style
         .box_shadow
+        .iter()
         .filter(|shadow| !shadow.inset && shadow.color[3] != 0)
     {
         let expansion = shadow.spread + shadow.blur.max(0.0);
@@ -5122,10 +5136,10 @@ fn paint_inline_fragment_decorations(
         let element_clip_mask = background_extra_clip(ancestor_clip_mask, clip_path_mask.as_ref());
         let background_mask = element_clip_mask.clone();
 
-        if let Some(shadow) = fragment_style.box_shadow {
+        for shadow in fragment_style.box_shadow.iter().filter(|s| !s.inset).rev() {
             paint_box_shadow(
                 pixmap,
-                &shadow,
+                shadow,
                 &fragment,
                 fragment_style.border_model.radii,
                 ancestor_clip_mask,
@@ -5262,6 +5276,16 @@ fn paint_inline_fragment_decorations(
                     background_mask.as_ref(),
                 );
             }
+        }
+        for shadow in fragment_style.box_shadow.iter().filter(|s| s.inset).rev() {
+            paint_inset_box_shadow(
+                pixmap,
+                shadow,
+                &fragment,
+                fragment_style.border,
+                fragment_style.border_model.radii,
+                ancestor_clip_mask,
+            );
         }
         paint_css_border(
             pixmap,
@@ -6215,9 +6239,9 @@ fn shade_border_color(color: [u8; 4], amount: f32) -> [u8; 4] {
 /// rounded rects from a solid core out to the blur radius, each at a fraction of
 /// the shadow alpha so source-over accumulation ramps the coverage from full at
 /// the core to near-zero at the outer edge. A shared mask removes the element's
-/// original border box from every outset layer. `inset` shadows are parsed but
-/// not painted. `clip`, when set, is the ancestor `overflow: hidden` region and
-/// is intersected with the shadow mask.
+/// original border box from every outset layer. `inset` shadows are handled by
+/// [`paint_inset_box_shadow`] instead. `clip`, when set, is the ancestor
+/// `overflow: hidden` region and is intersected with the shadow mask.
 fn paint_box_shadow(
     pixmap: &mut Pixmap,
     shadow: &crate::BoxShadow,
@@ -6320,6 +6344,156 @@ fn paint_box_shadow(
         }
     }
     // Ancestor overflow clip is already the complete rect/rounded chain.
+    pixmap.draw_pixmap(
+        left,
+        top,
+        shadow_pixmap.as_ref(),
+        &tiny_skia::PixmapPaint::default(),
+        Transform::identity(),
+        ancestor_clip,
+    );
+}
+
+/// Paint an `inset` `box-shadow` layer above the element's own background and
+/// below its border. `rect` is the element's (translate-adjusted) border box;
+/// the shadow shape is the padding box (the border box shrunk by `border`)
+/// offset by (offset_x, offset_y) and shrunk by `spread`. Unlike an outset
+/// shadow, the ink fills the padding box everywhere *outside* that shape (a
+/// ring hugging the inner edge, softened by `blur`), which is how CSS Pajamas-
+/// style form controls draw a border/background with `box-shadow: inset`
+/// instead of `border`. `clip`, when set, is the ancestor `overflow: hidden`
+/// region and is intersected with the shadow.
+fn paint_inset_box_shadow(
+    pixmap: &mut Pixmap,
+    shadow: &crate::BoxShadow,
+    rect: &crate::Rect,
+    border: crate::Edges,
+    border_radius: crate::BorderRadii,
+    ancestor_clip: Option<&tiny_skia::Mask>,
+) {
+    if !shadow.inset || shadow.color[3] == 0 {
+        return;
+    }
+    let border_sides = crate::Sides {
+        top: border.top,
+        right: border.right,
+        bottom: border.bottom,
+        left: border.left,
+    };
+    let padding_rect = inset_rect(rect, border_sides);
+    if padding_rect.width <= 0.0 || padding_rect.height <= 0.0 {
+        return;
+    }
+    if !rect_intersects_paint_surface(&padding_rect, pixmap, 1.0) {
+        return;
+    }
+    let padding_radii = border_radius
+        .resolve(rect.width, rect.height)
+        .inset(border_sides);
+    let radius = padding_radii.top_left;
+    let spread = shadow.spread;
+    let x0 = padding_rect.x + shadow.offset_x + spread;
+    let y0 = padding_rect.y + shadow.offset_y + spread;
+    let w0 = padding_rect.width - 2.0 * spread;
+    let h0 = padding_rect.height - 2.0 * spread;
+    let rx0 = (radius.0 - spread).max(0.0);
+    let ry0 = (radius.1 - spread).max(0.0);
+
+    let left = padding_rect.x.floor().max(0.0) as i32;
+    let top = padding_rect.y.floor().max(0.0) as i32;
+    let right = (padding_rect.x + padding_rect.width)
+        .ceil()
+        .min(pixmap.width() as f32) as i32;
+    let bottom = (padding_rect.y + padding_rect.height)
+        .ceil()
+        .min(pixmap.height() as f32) as i32;
+    if right <= left || bottom <= top {
+        return;
+    }
+    let Some(mut shadow_pixmap) = Pixmap::new((right - left) as u32, (bottom - top) as u32)
+    else {
+        return;
+    };
+    let local_padding_rect = crate::Rect {
+        x: padding_rect.x - left as f32,
+        y: padding_rect.y - top as f32,
+        ..padding_rect
+    };
+    let Some(padding_mask) = rounded_box_clip_mask_radii(
+        shadow_pixmap.width(),
+        shadow_pixmap.height(),
+        &local_padding_rect,
+        padding_radii,
+    ) else {
+        return;
+    };
+    let inner_x = x0 - left as f32;
+    let inner_y = y0 - top as f32;
+    let color = shadow.color;
+    let blur = shadow.blur.max(0.0);
+    // Paint the ring between the padding box and the (eroded) shadow shape.
+    // With no blur that is one crisp layer; with blur it is nested,
+    // progressively more eroded layers so the ring softens toward the box's
+    // interior, mirroring `paint_box_shadow`'s outward-dilation approximation.
+    let steps: u32 = if blur < 0.5 {
+        1
+    } else {
+        (blur.ceil() as u32).clamp(2, 24)
+    };
+    let a_frac = color[3] as f32 / 255.0;
+    let per = if steps <= 1 {
+        a_frac
+    } else {
+        1.0 - (1.0 - a_frac).powf(1.0 / steps as f32)
+    };
+    let layer_alpha = (per * 255.0).round().clamp(1.0, 255.0) as u8;
+    let layer_color = [color[0], color[1], color[2], layer_alpha];
+    for j in 0..steps {
+        let e = if steps <= 1 {
+            0.0
+        } else {
+            blur * (j as f32) / ((steps - 1) as f32)
+        };
+        let iw = (w0 - 2.0 * e).max(0.0);
+        let ih = (h0 - 2.0 * e).max(0.0);
+        let hole_mask = if iw > 0.0 && ih > 0.0 {
+            let mut hole = rounded_box_clip_mask_radii(
+                shadow_pixmap.width(),
+                shadow_pixmap.height(),
+                &crate::Rect {
+                    x: inner_x + e,
+                    y: inner_y + e,
+                    width: iw,
+                    height: ih,
+                },
+                crate::ResolvedBorderRadii {
+                    top_left: ((rx0 - e).max(0.0), (ry0 - e).max(0.0)),
+                    top_right: ((rx0 - e).max(0.0), (ry0 - e).max(0.0)),
+                    bottom_right: ((rx0 - e).max(0.0), (ry0 - e).max(0.0)),
+                    bottom_left: ((rx0 - e).max(0.0), (ry0 - e).max(0.0)),
+                },
+            );
+            if let Some(hole) = hole.as_mut() {
+                hole.invert();
+            }
+            hole
+        } else {
+            None
+        };
+        let combined_mask = intersect_clip_masks(Some(padding_mask.clone()), hole_mask.as_ref());
+        let layer_color = if steps <= 1 { color } else { layer_color };
+        fill_shadow_rect(
+            &mut shadow_pixmap,
+            local_padding_rect.x,
+            local_padding_rect.y,
+            local_padding_rect.width,
+            local_padding_rect.height,
+            padding_radii.top_left.0,
+            padding_radii.top_left.1,
+            layer_color,
+            combined_mask.as_ref(),
+        );
+    }
     pixmap.draw_pixmap(
         left,
         top,
@@ -8822,10 +8996,10 @@ fn paint_in_flow_generated_box(
         )
     });
 
-    if let Some(shadow) = style.box_shadow {
+    for shadow in style.box_shadow.iter().filter(|s| !s.inset).rev() {
         paint_box_shadow(
             pixmap,
-            &shadow,
+            shadow,
             &rect,
             style.border_model.radii,
             ancestor_clip_mask.as_ref(),
@@ -8976,6 +9150,16 @@ fn paint_in_flow_generated_box(
         }
     }
 
+    for shadow in style.box_shadow.iter().filter(|s| s.inset).rev() {
+        paint_inset_box_shadow(
+            pixmap,
+            shadow,
+            &rect,
+            style.border,
+            style.border_model.radii,
+            ancestor_clip_mask.as_ref(),
+        );
+    }
     paint_css_border(
         pixmap,
         &rect,
@@ -11764,6 +11948,63 @@ mod tests {
                 && blurred_edge.green() < 240
                 && blurred_edge.blue() < 240,
             "the issue's 2px 2px 3px shadow must retain ink outside the box: {blurred_edge:?}"
+        );
+    }
+
+    #[test]
+    fn inset_box_shadow_paints_ring_inside_border_box() {
+        let tree = parse_html(
+            r#"<html style="margin:0"><body style="margin:0;background:rgb(200,200,200)">
+                <div style="position:absolute;left:10px;top:10px;width:60px;height:60px;
+                            background:white;box-shadow:inset 0 0 0 8px black"></div>
+            </body></html>"#,
+        );
+        let pixmap = paint_dom(&tree, (100.0, 100.0), None).expect("inset box shadow paint");
+
+        let ring = pixmap.pixel(14, 40).expect("inside the 8px ring, near the border box edge");
+        assert!(
+            ring.red() < 10 && ring.green() < 10 && ring.blue() < 10,
+            "an inset shadow must paint ink inside the padding box near its edge: {ring:?}"
+        );
+        let interior = pixmap.pixel(40, 40).expect("interior, beyond the shadow's spread");
+        assert_eq!(
+            (interior.red(), interior.green(), interior.blue()),
+            (255, 255, 255),
+            "an inset shadow must not cover the box interior beyond its spread: {interior:?}"
+        );
+        let outside_box = pixmap.pixel(5, 40).expect("outside the border box");
+        assert_eq!(
+            (outside_box.red(), outside_box.green(), outside_box.blue()),
+            (200, 200, 200),
+            "an inset shadow must not leak outside the element's own border box: {outside_box:?}"
+        );
+    }
+
+    #[test]
+    fn box_shadow_layers_paint_first_declared_layer_on_top() {
+        // The first layer's ring (0-3px out) must win over the second layer's
+        // wherever they overlap, and the second layer must still paint in the
+        // band it alone covers (3-6px out) -- proving every layer is both
+        // parsed and painted, not just the first one.
+        let tree = parse_html(
+            r#"<html style="margin:0"><body style="margin:0;background:white">
+                <div style="position:absolute;left:20px;top:20px;width:40px;height:30px;
+                            box-shadow:0 0 0 3px red, 0 0 0 6px blue"></div>
+            </body></html>"#,
+        );
+        let pixmap = paint_dom(&tree, (100.0, 80.0), None).expect("layered box shadow paint");
+
+        let overlap = pixmap.pixel(18, 35).expect("0-3px band, covered by both layers");
+        assert!(
+            overlap.red() > 245 && overlap.green() < 10 && overlap.blue() < 10,
+            "the first-declared (red) layer must paint on top in the overlap: {overlap:?}"
+        );
+        let second_only = pixmap
+            .pixel(15, 35)
+            .expect("3-6px band, covered only by the second layer");
+        assert!(
+            second_only.blue() > 245 && second_only.red() < 10 && second_only.green() < 10,
+            "the second-declared (blue) layer must still be painted, not dropped: {second_only:?}"
         );
     }
 
@@ -16980,14 +17221,14 @@ mod tests {
         ));
 
         let mut style = crate::LayoutStyle::default();
-        style.box_shadow = Some(crate::BoxShadow {
+        style.box_shadow = vec![crate::BoxShadow {
             offset_x: -24.0,
             offset_y: 0.0,
             blur: 8.0,
             spread: 2.0,
             color: [0, 0, 0, 255],
             inset: false,
-        });
+        }];
         style.outline.style = crate::BorderStyle::Solid;
         style.outline.specified_width = 4.0;
         style.outline.offset = 3.0;

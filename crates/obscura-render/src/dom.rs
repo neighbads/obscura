@@ -10092,7 +10092,7 @@ fn pseudo_requires_generated_box(style: &crate::LayoutStyle, content: Option<&st
         || style.background_conic_gradient.is_some()
         || style.background_image.is_some()
         || style.mask_image.is_some()
-        || style.box_shadow.is_some()
+        || !style.box_shadow.is_empty()
         || !style.border_model.radii.is_zero()
         || style.overflow_hidden
         || !style.transform_ops.is_empty()

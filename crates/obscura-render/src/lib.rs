@@ -1600,11 +1600,14 @@ pub struct LayoutStyle {
     /// Authored `transform-origin`, unresolved so percentages use the final
     /// border-box dimensions. `None` is the CSS initial value, 50% 50%.
     pub transform_origin: Option<(Dimension, Dimension)>,
-    /// `box-shadow` (first layer only). Painted behind the element's own
-    /// background/border box: cards, buttons, menus, and modals across the
-    /// modern web rely on it for depth, and without it those elements paint
-    /// flat. See [`BoxShadow`] and `paint::paint_box_shadow`.
-    pub box_shadow: Option<BoxShadow>,
+    /// `box-shadow` layers, in declaration order. Outset layers paint behind
+    /// the element's own background/border box; inset layers paint above the
+    /// background but below the border. Cards, buttons, menus, and modals
+    /// across the modern web rely on this for depth (and, via `inset`, for
+    /// form-control borders), and without it those elements paint flat. Per
+    /// CSS, the first declared layer is the topmost. See [`BoxShadow`],
+    /// `paint::paint_box_shadow`, and `paint::paint_inset_box_shadow`.
+    pub box_shadow: Vec<BoxShadow>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1755,8 +1758,8 @@ pub enum BoxSizing {
 /// One `box-shadow` layer. Offsets, blur, and spread are in CSS px; `color` is
 /// the resolved RGBA (falling back to the element's text color, per CSS
 /// `currentColor`, when the value omits a color); `inset` distinguishes an
-/// inner shadow from the default outer (drop) shadow. Only the first layer of a
-/// comma-separated list is modeled.
+/// inner shadow from the default outer (drop) shadow. A comma-separated list
+/// parses into one [`LayoutStyle::box_shadow`] entry per layer.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct BoxShadow {
     pub offset_x: f32,

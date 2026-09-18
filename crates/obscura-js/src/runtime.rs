@@ -19298,6 +19298,50 @@ mod tests {
         );
     }
 
+    // R-18: `document.body`/`document.documentElement` are not O(1) cached
+    // the way real Chrome's are (`body` re-runs a full `querySelector("body")`
+    // scan every access). elementFromPoint used to read `this.body` inside
+    // its per-candidate loop and its per-ancestor overflow-clip walk, turning
+    // one hit-test into an O(n) number of full-document scans. Pages that
+    // hit-test on every pointer move (drag/hover/calendar libraries) then
+    // buried the isolate under quadratic blowup, tripping the script
+    // watchdog and presenting as an unresponsive hang (booking.com repro).
+    // `document.body` must be read at most a constant number of times per
+    // elementFromPoint call, not once per candidate element.
+    #[test]
+    fn element_from_point_reads_document_body_a_constant_number_of_times() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let calls = rt
+            .evaluate(
+                "(function() {
+                    for (var i = 0; i < 50; i++) {
+                        var d = document.createElement('div');
+                        d.id = 'd' + i;
+                        document.body.appendChild(d);
+                    }
+                    var count = 0;
+                    var orig = Document.prototype.querySelector;
+                    Document.prototype.querySelector = function(s) {
+                        count++;
+                        return orig.call(this, s);
+                    };
+                    try {
+                        document.elementFromPoint(10, 10);
+                    } finally {
+                        Document.prototype.querySelector = orig;
+                    }
+                    return count;
+                })()",
+            )
+            .unwrap();
+        let n = calls.as_f64().unwrap() as i64;
+        assert!(
+            n <= 4,
+            "elementFromPoint should read document.body a constant number of times, not once \
+             per candidate element (querySelector was called {n} times for 50 candidates)"
+        );
+    }
+
     // The IndexedDB shim previously exposed no IDBTransaction/IDBDatabase/
     // IDBObjectStore/etc. globals (libraries that feature-detect IndexedDB
     // support via `typeof IDBTransaction` treat it as unsupported and never
@@ -21033,6 +21077,38 @@ mod tests {
             )
             .unwrap();
         assert_eq!(result, serde_json::json!("SPAN"));
+    }
+
+    // R-18: a MutationObserver observing with `attributeFilter: ['src']` must
+    // only be notified for `src` changes, not for every attribute change on
+    // the target. Real-world consent-management scripts (e.g. OneTrust's
+    // OtAutoBlock.js) rely on this: their handler reacts to a `src` mutation
+    // by setting the element's `type` attribute, and expects that write to be
+    // invisible to its own `attributeFilter: ['src']` observer. Without the
+    // filter, the handler re-triggers itself on every unrelated attribute
+    // write, looping forever (observed as a CPU-spinning hang on
+    // booking.com).
+    #[test]
+    fn attribute_filter_restricts_mutation_observer_notifications() {
+        let mut rt =
+            setup_runtime(r#"<html><body><script id="s" src="a.js"></script></body></html>"#);
+        let result = rt
+            .evaluate(
+                r#"
+                var scriptTestSetup = true;
+                const el = document.getElementById('s');
+                const observer = new MutationObserver(() => {});
+                observer.observe(el, { attributes: true, attributeFilter: ['src'] });
+                el.setAttribute('type', 'text/plain');
+                el.setAttribute('data-x', '1');
+                el.setAttribute('src', 'b.js');
+                const seen = observer.takeRecords().map((record) => record.attributeName);
+                observer.disconnect();
+                return seen.join(',');
+                "#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!("src"));
     }
 
     #[test]

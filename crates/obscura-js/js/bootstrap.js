@@ -9419,7 +9419,8 @@ globalThis.__notifyMutation = function(type, target_nid, addedNodes, removedNode
       // characterData mutations need options.characterData, childList
       // needs options.childList.
       const wantsType =
-        (type === 'attributes' && t.options.attributes) ||
+        (type === 'attributes' && t.options.attributes &&
+          (!t.options.attributeFilter || t.options.attributeFilter.includes(attributeName))) ||
         (type === 'characterData' && t.options.characterData) ||
         (type === 'childList' && t.options.childList);
       if (!wantsType) continue;
@@ -15837,12 +15838,22 @@ if (typeof Document !== 'undefined' && !Document.prototype.elementFromPoint) {
     if (x < 0 || y < 0 || x > w || y > h) return null;
     var all = this.querySelectorAll('*');
     var candidates = [];
+    // Hoisted once: `this.body`/`this.documentElement` each re-run a full
+    // selector query (they're not cached like real Chrome's O(1) document
+    // accessors), so reading them inside this per-element loop turned a
+    // single elementFromPoint call into an O(n * DOM size) scan. Callers
+    // that hit-test on every pointer move / animation frame (drag, map,
+    // calendar hover libraries) then buried the isolate under a quadratic
+    // blowup on large real-world pages, tripping the script watchdog and
+    // presenting as an unresponsive hang (booking.com repro).
+    var docBody = this.body;
+    var docEl = this.documentElement;
     for (var i = 0; i < all.length; i++) {
       var el = all[i];
       if (!el || !el.getBoundingClientRect) continue;
       // documentElement / body span the viewport; skip them so we pick a
       // real descendant instead of falling back to <html>/<body>.
-      if (el === this.documentElement || el === this.body) continue;
+      if (el === docEl || el === docBody) continue;
       var r = el.getBoundingClientRect();
       if (r.width === 0 || r.height === 0) continue;
       if (x >= r.left && x <= r.right && y >= r.top && y <= r.bottom) {
@@ -15861,7 +15872,7 @@ if (typeof Document !== 'undefined' && !Document.prototype.elementFromPoint) {
         // instead of the page behind it.
         var visible = true;
         var ancestor = el.parentElement;
-        while (ancestor && ancestor !== this.documentElement && ancestor !== this.body) {
+        while (ancestor && ancestor !== docEl && ancestor !== docBody) {
           var style = null;
           try { style = getComputedStyle(ancestor); } catch (_e) {}
           var ox = style ? (style.overflowX || style.overflow || '') : '';
@@ -15908,7 +15919,7 @@ if (typeof Document !== 'undefined' && !Document.prototype.elementFromPoint) {
       }
       if (!isAncestorOfOther) { best = c; break; }
     }
-    return best || this.body || this.documentElement || null;
+    return best || docBody || docEl || null;
   };
   Document.prototype.elementsFromPoint = function(x, y) {
     var el = this.elementFromPoint(x, y);

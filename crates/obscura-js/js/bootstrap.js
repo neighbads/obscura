@@ -5140,6 +5140,14 @@ class Element extends Node {
   }
 }
 
+// Base interface for every element in the HTML namespace. Concrete HTML
+// interfaces (HTMLDivElement, HTMLInputElement, ...) extend this rather than
+// Element directly, so `x instanceof HTMLElement` is true for any HTML
+// element (matching the spec) while `x instanceof HTMLDivElement` stays true
+// only for the specific interface. SVG elements extend SVGElement (below,
+// itself extending Element), not this class.
+class HTMLElement extends Element {}
+
 // WHATWG "convert nodes into a node": a Node argument passes through, anything
 // else is stringified into a Text node, so e.g. append(null) inserts the text
 // "null" and append(undefined) inserts "undefined" per the (Node or DOMString)
@@ -6172,7 +6180,7 @@ function _imageEncodingError() {
 // layout/paint. The render-only native op owns responsive candidate selection,
 // fetching, and metadata sniffing; bootstrap owns only the observable request
 // state and event timing.
-class HTMLImageElement extends Element {
+class HTMLImageElement extends HTMLElement {
   constructor(nid) {
     super(nid);
     this._imageRequest = 0;
@@ -6494,7 +6502,7 @@ _markNative(HTMLImageElement.prototype.decode);
 
 // Report only capabilities backed by a real decoder. Poster rendering is an
 // image operation and does not make any audio/video container playable.
-class HTMLMediaElement extends Element {
+class HTMLMediaElement extends HTMLElement {
   static NETWORK_EMPTY = 0;
   static NETWORK_IDLE = 1;
   static NETWORK_LOADING = 2;
@@ -6568,7 +6576,7 @@ class HTMLVideoElement extends HTMLMediaElement {
   get videoHeight() { return 0; }
 }
 class HTMLAudioElement extends HTMLMediaElement {}
-class HTMLTrackElement extends Element {
+class HTMLTrackElement extends HTMLElement {
   static NONE = 0;
   static LOADING = 1;
   static LOADED = 2;
@@ -6601,6 +6609,35 @@ globalThis.TextTrackCue = TextTrackCue;
 globalThis.TextTrackCueList = TextTrackCueList;
 globalThis.VTTCue = VTTCue;
 
+// WHATWG tag-name -> interface map for the HTML elements that don't need
+// their own case above (no extra behavior beyond the base HTMLElement
+// members). Keyed by string so this can sit above the `globalThis.HTMLXxx =
+// class ...` definitions further down the file; every lookup goes through
+// `globalThis[...]` at call time, once those classes exist. Every entry here
+// used to fall through to the generic `Element` class, which made
+// `x instanceof HTMLDivElement` (and friends) true for every element on the
+// page -- the same defect class as the HTMLIFrameElement regression above.
+const _htmlTagElementClasses = {
+  DIV: "HTMLDivElement", SPAN: "HTMLSpanElement", P: "HTMLParagraphElement",
+  A: "HTMLAnchorElement", INPUT: "HTMLInputElement", BUTTON: "HTMLButtonElement",
+  SELECT: "HTMLSelectElement", LABEL: "HTMLLabelElement", TABLE: "HTMLTableElement",
+  SCRIPT: "HTMLScriptElement", STYLE: "HTMLStyleElement", LINK: "HTMLLinkElement",
+  META: "HTMLMetaElement", HEAD: "HTMLHeadElement", BODY: "HTMLBodyElement",
+  HTML: "HTMLHtmlElement", BR: "HTMLBRElement", HR: "HTMLHRElement",
+  UL: "HTMLUListElement", OL: "HTMLOListElement", LI: "HTMLLIElement",
+  PRE: "HTMLPreElement",
+  H1: "HTMLHeadingElement", H2: "HTMLHeadingElement", H3: "HTMLHeadingElement",
+  H4: "HTMLHeadingElement", H5: "HTMLHeadingElement", H6: "HTMLHeadingElement",
+  TEMPLATE: "HTMLTemplateElement", OPTION: "HTMLOptionElement",
+  DATALIST: "HTMLDataListElement", FIELDSET: "HTMLFieldSetElement",
+  LEGEND: "HTMLLegendElement", PROGRESS: "HTMLProgressElement",
+  DETAILS: "HTMLDetailsElement", DIALOG: "HTMLDialogElement",
+  SOURCE: "HTMLSourceElement", PICTURE: "HTMLPictureElement",
+  TR: "HTMLTableRowElement", TD: "HTMLTableCellElement", TH: "HTMLTableCellElement",
+  THEAD: "HTMLTableSectionElement", TBODY: "HTMLTableSectionElement",
+  TFOOT: "HTMLTableSectionElement",
+};
+
 function _elementClassFor(nid) {
   const tag = _domParse("tag_name", nid);
   // HTML tagName values are ASCII-uppercase. Foreign SVG names retain their
@@ -6626,7 +6663,9 @@ function _elementClassFor(nid) {
   if (tag === "VIDEO") return HTMLVideoElement;
   if (tag === "TRACK") return HTMLTrackElement;
   if (tag === "IFRAME" && globalThis.HTMLIFrameElement) return globalThis.HTMLIFrameElement;
-  return Element;
+  const mapped = _htmlTagElementClasses[tag];
+  if (mapped && globalThis[mapped]) return globalThis[mapped];
+  return globalThis.HTMLElement || Element;
 }
 function _elementClassForKnownName(namespace, qualifiedName) {
   const localName = qualifiedName.includes(":")
@@ -6648,6 +6687,9 @@ function _elementClassForKnownName(namespace, qualifiedName) {
     if (tag === "VIDEO") return HTMLVideoElement;
     if (tag === "TRACK") return HTMLTrackElement;
     if (tag === "IFRAME" && globalThis.HTMLIFrameElement) return globalThis.HTMLIFrameElement;
+    const mapped = _htmlTagElementClasses[tag];
+    if (mapped && globalThis[mapped]) return globalThis[mapped];
+    if (globalThis.HTMLElement) return globalThis.HTMLElement;
   }
   return Element;
 }
@@ -9536,7 +9578,7 @@ class CustomElementRegistry {
 }
 globalThis.CustomElementRegistry = CustomElementRegistry;
 globalThis.customElements = new CustomElementRegistry();
-globalThis.HTMLUnknownElement = Element;
+globalThis.HTMLUnknownElement = class HTMLUnknownElement extends HTMLElement {};
 // ElementInternals: form-associated custom element internals. Validity/state
 // are JS-observable; ARIA reflection that needs the accessibility tree is not.
 globalThis.ElementInternals = class ElementInternals {
@@ -11920,15 +11962,15 @@ globalThis.CSS = {
   escape(s){ return s; }
 };
 
-globalThis.HTMLElement = Element;
-globalThis.HTMLDivElement = Element;
-globalThis.HTMLSpanElement = Element;
-globalThis.HTMLParagraphElement = Element;
-globalThis.HTMLAnchorElement = Element;
+globalThis.HTMLElement = HTMLElement;
+globalThis.HTMLDivElement = class HTMLDivElement extends HTMLElement {};
+globalThis.HTMLSpanElement = class HTMLSpanElement extends HTMLElement {};
+globalThis.HTMLParagraphElement = class HTMLParagraphElement extends HTMLElement {};
+globalThis.HTMLAnchorElement = class HTMLAnchorElement extends HTMLElement {};
 globalThis.HTMLImageElement = HTMLImageElement;
-globalThis.HTMLInputElement = Element;
-globalThis.HTMLButtonElement = Element;
-globalThis.HTMLFormElement = class HTMLFormElement extends Element {
+globalThis.HTMLInputElement = class HTMLInputElement extends HTMLElement {};
+globalThis.HTMLButtonElement = class HTMLButtonElement extends HTMLElement {};
+globalThis.HTMLFormElement = class HTMLFormElement extends HTMLElement {
   get elements() { return HTMLCollection._from(this.querySelectorAll("input, select, textarea, button, fieldset, output, object")); }
   get length() { return this.elements.length; }
   // Inherit submit() from Element.prototype: it dispatches the cancelable
@@ -11950,8 +11992,8 @@ globalThis.HTMLFormElement = class HTMLFormElement extends Element {
     }
   }
 };
-globalThis.HTMLSelectElement = Element;
-globalThis.HTMLTextAreaElement = class HTMLTextAreaElement extends Element {
+globalThis.HTMLSelectElement = class HTMLSelectElement extends HTMLElement {};
+globalThis.HTMLTextAreaElement = class HTMLTextAreaElement extends HTMLElement {
   // `rows`/`cols` reflect the content attributes and drive the control's
   // intrinsic box (the renderer sizes a textarea from them). The attributes
   // are limited to positive non-zero numbers; anything else falls back to the
@@ -11968,26 +12010,31 @@ globalThis.HTMLTextAreaElement = class HTMLTextAreaElement extends Element {
   }
   set cols(v) { this.setAttribute('cols', String(v)); }
 };
-globalThis.HTMLLabelElement = Element;
-globalThis.HTMLTableElement = Element;
-globalThis.HTMLIFrameElement = class HTMLIFrameElement extends Element {};
-globalThis.HTMLCanvasElement = Element;
+globalThis.HTMLLabelElement = class HTMLLabelElement extends HTMLElement {};
+globalThis.HTMLTableElement = class HTMLTableElement extends HTMLElement {};
+globalThis.HTMLIFrameElement = class HTMLIFrameElement extends HTMLElement {};
+// HTMLCanvasElement is defined below (getContext/toDataURL/toBlob support).
 // HTMLVideoElement and HTMLAudioElement are defined above with canPlayType support.
-globalThis.HTMLScriptElement = Element;
-globalThis.HTMLStyleElement = Element;
-globalThis.HTMLLinkElement = Element;
-globalThis.HTMLMetaElement = Element;
-globalThis.HTMLHeadElement = Element;
-globalThis.HTMLBodyElement = Element;
-globalThis.HTMLHtmlElement = Element;
-globalThis.HTMLBRElement = Element;
-globalThis.HTMLHRElement = Element;
-globalThis.HTMLUListElement = Element;
-globalThis.HTMLOListElement = Element;
-globalThis.HTMLLIElement = Element;
-globalThis.HTMLPreElement = Element;
-globalThis.HTMLHeadingElement = Element;
-globalThis.HTMLTemplateElement = Element;
+globalThis.HTMLScriptElement = class HTMLScriptElement extends HTMLElement {};
+globalThis.HTMLStyleElement = class HTMLStyleElement extends HTMLElement {};
+globalThis.HTMLLinkElement = class HTMLLinkElement extends HTMLElement {};
+globalThis.HTMLMetaElement = class HTMLMetaElement extends HTMLElement {};
+globalThis.HTMLHeadElement = class HTMLHeadElement extends HTMLElement {};
+globalThis.HTMLBodyElement = class HTMLBodyElement extends HTMLElement {};
+globalThis.HTMLHtmlElement = class HTMLHtmlElement extends HTMLElement {};
+globalThis.HTMLBRElement = class HTMLBRElement extends HTMLElement {};
+globalThis.HTMLHRElement = class HTMLHRElement extends HTMLElement {};
+globalThis.HTMLUListElement = class HTMLUListElement extends HTMLElement {};
+globalThis.HTMLOListElement = class HTMLOListElement extends HTMLElement {};
+globalThis.HTMLLIElement = class HTMLLIElement extends HTMLElement {};
+globalThis.HTMLPreElement = class HTMLPreElement extends HTMLElement {};
+globalThis.HTMLHeadingElement = class HTMLHeadingElement extends HTMLElement {};
+globalThis.HTMLTemplateElement = class HTMLTemplateElement extends HTMLElement {};
+globalThis.HTMLSourceElement = class HTMLSourceElement extends HTMLElement {};
+globalThis.HTMLPictureElement = class HTMLPictureElement extends HTMLElement {};
+globalThis.HTMLTableRowElement = class HTMLTableRowElement extends HTMLElement {};
+globalThis.HTMLTableCellElement = class HTMLTableCellElement extends HTMLElement {};
+globalThis.HTMLTableSectionElement = class HTMLTableSectionElement extends HTMLElement {};
 // <slot> needs its own brand: with `HTMLSlotElement = Element` every element
 // was an instance, but assignedElements() did not exist, so the common
 // `el instanceof HTMLSlotElement && el.assignedElements()` guard (Swiper's
@@ -12030,19 +12077,40 @@ function _slotAssignedNodes(slot, flatten) {
   }
   return out;
 }
-globalThis.HTMLSlotElement = class HTMLSlotElement extends Element {
+globalThis.HTMLSlotElement = class HTMLSlotElement extends HTMLElement {
   get name() { return this.getAttribute('name') || ''; }
   set name(v) { this.setAttribute('name', String(v)); }
   assignedNodes(options) { return _slotAssignedNodes(this, !!(options && options.flatten)); }
   assignedElements(options) { return this.assignedNodes(options).filter(n => n.nodeType === 1); }
 };
-globalThis.HTMLOptionElement = Element;
-globalThis.HTMLDataListElement = Element;
-globalThis.HTMLFieldSetElement = Element;
-globalThis.HTMLLegendElement = Element;
-globalThis.HTMLProgressElement = Element;
-globalThis.HTMLDetailsElement = Element;
-globalThis.HTMLDialogElement = Element;
+globalThis.HTMLOptionElement = class HTMLOptionElement extends HTMLElement {};
+globalThis.HTMLDataListElement = class HTMLDataListElement extends HTMLElement {};
+globalThis.HTMLFieldSetElement = class HTMLFieldSetElement extends HTMLElement {};
+globalThis.HTMLLegendElement = class HTMLLegendElement extends HTMLElement {};
+globalThis.HTMLProgressElement = class HTMLProgressElement extends HTMLElement {};
+globalThis.HTMLDetailsElement = class HTMLDetailsElement extends HTMLElement {};
+globalThis.HTMLDialogElement = class HTMLDialogElement extends HTMLElement {};
+// value/files/checked/indeterminate/selected/selectedIndex are implemented
+// once, generically, as own accessors on Element.prototype (they dispatch
+// internally on this.localName and never assume a particular prototype).
+// Code that expects real interface layering — e.g. React's input value
+// tracker, which does a non-inherited
+// Object.getOwnPropertyDescriptor(el.constructor.prototype, 'value') — needs
+// these to also be OWN properties of the specific interface prototypes that
+// have them per spec. Mirror the same descriptor objects onto those
+// prototypes; this only adds an own copy earlier in the chain, it does not
+// remove the generic fallback other tags still rely on through Element.prototype.
+{
+  const valueDesc = Object.getOwnPropertyDescriptor(Element.prototype, 'value');
+  for (const ctor of [HTMLInputElement, HTMLTextAreaElement, HTMLSelectElement, HTMLOptionElement, HTMLButtonElement]) {
+    Object.defineProperty(ctor.prototype, 'value', valueDesc);
+  }
+  Object.defineProperty(HTMLInputElement.prototype, 'files', Object.getOwnPropertyDescriptor(Element.prototype, 'files'));
+  Object.defineProperty(HTMLInputElement.prototype, 'checked', Object.getOwnPropertyDescriptor(Element.prototype, 'checked'));
+  Object.defineProperty(HTMLInputElement.prototype, 'indeterminate', Object.getOwnPropertyDescriptor(Element.prototype, 'indeterminate'));
+  Object.defineProperty(HTMLOptionElement.prototype, 'selected', Object.getOwnPropertyDescriptor(Element.prototype, 'selected'));
+  Object.defineProperty(HTMLSelectElement.prototype, 'selectedIndex', Object.getOwnPropertyDescriptor(Element.prototype, 'selectedIndex'));
+}
 // SVGAnimatedString backs the className and href reflections on SVG elements.
 // baseVal and animVal both read the live attribute (no SMIL animation), and
 // baseVal is writable. Used by the SVG-aware get className()/get href() above.
@@ -13459,7 +13527,7 @@ class _Canvas2D {
   getContextAttributes() { return { alpha: true, desynchronized: false, colorSpace: "srgb", willReadFrequently: false }; }
 }
 
-class HTMLCanvasElement extends Element {
+class HTMLCanvasElement extends HTMLElement {
   get width() {
     const raw = this.getAttribute('width');
     const parsed = raw === null ? 300 : Number.parseInt(raw, 10);

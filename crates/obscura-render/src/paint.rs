@@ -1595,35 +1595,24 @@ impl PreparedRender {
             .to_string(),
         );
 
-        let overflow_axis = |specified: u8, clipped: bool, scroll: bool| {
-            if scroll {
-                // The compact layout model intentionally merges
-                // hidden/auto/scroll for clipping. `auto` is the least
-                // surprising computed scroll-container value.
-                "auto"
-            } else if specified == 1 || clipped {
-                "clip"
-            } else {
-                "visible"
-            }
+        // The internal clip model deliberately merges hidden/auto/scroll
+        // (see `recompute_overflow`), but `overflow_declared_x`/`_y` retain
+        // the distinction so the reported computed value matches the CSS
+        // Overflow spec instead of always collapsing to "auto".
+        let overflow_axis = |css: u8| match css {
+            0 => "visible",
+            1 => "clip",
+            2 => "hidden",
+            3 => "scroll",
+            _ => "auto",
         };
         out.insert(
             "overflow-x",
-            overflow_axis(
-                style.overflow_specified_x,
-                style.overflow_clip_x,
-                style.overflow_scroll_x,
-            )
-            .to_string(),
+            overflow_axis(style.overflow_css_x).to_string(),
         );
         out.insert(
             "overflow-y",
-            overflow_axis(
-                style.overflow_specified_y,
-                style.overflow_clip_y,
-                style.overflow_scroll_y,
-            )
-            .to_string(),
+            overflow_axis(style.overflow_css_y).to_string(),
         );
 
         for (name, value, auto) in [
@@ -15736,6 +15725,40 @@ mod tests {
         assert_eq!(computed("right")["clear"], "both");
         assert_eq!(computed("plain")["float"], "none");
         assert_eq!(computed("plain")["clear"], "none");
+    }
+
+    // R-15: the internal clip model merges hidden/auto/scroll into one
+    // bucket, but `getComputedStyle().overflow[XY]` must still report the
+    // author's actual keyword instead of always collapsing to "auto".
+    #[test]
+    fn computed_style_reports_declared_overflow_keyword_not_always_auto() {
+        let tree = parse_html(
+            r#"<div id="hidden" style="overflow:hidden"></div>
+               <div id="scroll" style="overflow:scroll"></div>
+               <div id="auto" style="overflow:auto"></div>
+               <div id="clip" style="overflow:clip"></div>
+               <div id="visible" style="overflow:visible"></div>
+               <div id="mixed" style="overflow-x:hidden;overflow-y:visible"></div>"#,
+        );
+        let mut resources = RenderResourceCache::default();
+        let prepared =
+            prepare_dom(&tree, (320.0, 200.0), None, &mut resources).expect("prepared render");
+        let computed = |id| {
+            prepared
+                .computed_style(tree.get_element_by_id(id).unwrap())
+                .expect("computed style")
+        };
+
+        assert_eq!(computed("hidden")["overflow-x"], "hidden");
+        assert_eq!(computed("hidden")["overflow-y"], "hidden");
+        assert_eq!(computed("scroll")["overflow-x"], "scroll");
+        assert_eq!(computed("auto")["overflow-x"], "auto");
+        assert_eq!(computed("clip")["overflow-x"], "clip");
+        assert_eq!(computed("visible")["overflow-x"], "visible");
+        // `overflow-y:visible` paired with a scrollable `overflow-x` computes
+        // to `auto`, not `visible` (CSS Overflow Module Level 3 coupling).
+        assert_eq!(computed("mixed")["overflow-x"], "hidden");
+        assert_eq!(computed("mixed")["overflow-y"], "auto");
     }
 
     #[test]

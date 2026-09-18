@@ -1389,6 +1389,18 @@ pub struct LayoutStyle {
     pub(crate) overflow_inherit_y: bool,
     pub(crate) overflow_scroll_x: bool,
     pub(crate) overflow_scroll_y: bool,
+    /// This axis's own declared keyword, retaining the hidden/auto/scroll
+    /// distinction that `overflow_specified_x`/`_y` intentionally merge for
+    /// the internal clip model. Set once from the parsed value and never
+    /// touched by the visible/clip coupling below, so repeated cascade
+    /// passes always couple from the true per-axis source. 0=visible,
+    /// 1=clip, 2=hidden, 3=scroll, 4=auto.
+    pub(crate) overflow_declared_x: u8,
+    pub(crate) overflow_declared_y: u8,
+    /// The final per-axis keyword after CSS Overflow's visible/clip coupling,
+    /// ready for `getComputedStyle().overflow[XY]`.
+    pub(crate) overflow_css_x: u8,
+    pub(crate) overflow_css_y: u8,
     /// This element's authored overflow is propagated to the viewport. Its
     /// own box therefore behaves as `overflow: visible` for layout/BFC
     /// purposes while the capture viewport supplies the paint clip.

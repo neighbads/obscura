@@ -559,20 +559,29 @@ fn parse_container_shorthand(value: &str) -> Option<(Vec<String>, crate::Contain
 #[derive(Clone, Copy)]
 struct ParsedOverflowAxis {
     specified: u8,
+    // Declared keyword distinct from `specified` (0=visible, 1=clip,
+    // 2=hidden, 3=scroll, 4=auto), retained for `getComputedStyle`.
+    declared: u8,
     inherit: bool,
 }
 
 fn parse_overflow_axis(value: &str) -> Option<ParsedOverflowAxis> {
     let lower = value.trim().to_ascii_lowercase();
-    let (specified, inherit) = match lower.as_str() {
-        "visible" => (0, false),
-        "clip" => (1, false),
-        "hidden" | "scroll" | "auto" | "overlay" => (2, false),
-        "inherit" => (0, true),
-        "initial" | "unset" | "revert" | "revert-layer" => (0, false),
+    let (specified, declared, inherit) = match lower.as_str() {
+        "visible" => (0, 0, false),
+        "clip" => (1, 1, false),
+        "hidden" => (2, 2, false),
+        "scroll" => (2, 3, false),
+        "auto" | "overlay" => (2, 4, false),
+        "inherit" => (0, 0, true),
+        "initial" | "unset" | "revert" | "revert-layer" => (0, 0, false),
         _ => return None,
     };
-    Some(ParsedOverflowAxis { specified, inherit })
+    Some(ParsedOverflowAxis {
+        specified,
+        declared,
+        inherit,
+    })
 }
 
 fn parse_overflow_declaration(
@@ -624,11 +633,15 @@ pub(crate) fn recompute_overflow(style: &mut LayoutStyle) {
     // `hidden`. A clip/visible pair remains genuinely axis-specific.
     let mut computed_x = style.overflow_specified_x;
     let mut computed_y = style.overflow_specified_y;
+    let mut css_x = style.overflow_declared_x;
+    let mut css_y = style.overflow_declared_y;
     if (computed_x == 2) != (computed_y == 2) {
         if computed_x == 2 {
             computed_y = 2;
+            css_y = if css_y == 1 { 2 } else { 4 };
         } else {
             computed_x = 2;
+            css_x = if css_x == 1 { 2 } else { 4 };
         }
     }
     style.overflow_clip_x = computed_x != 0;
@@ -637,6 +650,8 @@ pub(crate) fn recompute_overflow(style: &mut LayoutStyle) {
     style.overflow_scroll_y = computed_y == 2;
     style.overflow_hidden = style.overflow_clip_x || style.overflow_clip_y;
     style.overflow_scroll_container = style.overflow_scroll_x || style.overflow_scroll_y;
+    style.overflow_css_x = css_x;
+    style.overflow_css_y = css_y;
 }
 
 fn parse_font_variation_settings(value: &str) -> Option<Vec<crate::FontVariationSetting>> {
@@ -1438,10 +1453,12 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
             };
             if let Some(x) = x {
                 style.overflow_specified_x = x.specified;
+                style.overflow_declared_x = x.declared;
                 style.overflow_inherit_x = x.inherit;
             }
             if let Some(y) = y {
                 style.overflow_specified_y = y.specified;
+                style.overflow_declared_y = y.declared;
                 style.overflow_inherit_y = y.inherit;
             }
             style.overflow_axes_set = true;
@@ -10723,6 +10740,39 @@ mod tests {
         assert!(style.overflow_clip_x);
         assert!(!style.overflow_clip_y);
         assert!(!style.overflow_scroll_container);
+    }
+
+    // R-15: `overflow_specified_x`/`_y` intentionally merge hidden/auto/scroll
+    // into one internal clip bucket, but `overflow_css_x`/`_y` must retain the
+    // distinction so `getComputedStyle` can report the true keyword.
+    #[test]
+    fn overflow_css_value_retains_hidden_auto_scroll_distinction() {
+        let hidden = compute_style("div", Some("overflow:hidden"));
+        assert_eq!(hidden.overflow_css_x, 2);
+        assert_eq!(hidden.overflow_css_y, 2);
+
+        let auto = compute_style("div", Some("overflow:auto"));
+        assert_eq!(auto.overflow_css_x, 4);
+        assert_eq!(auto.overflow_css_y, 4);
+
+        let scroll = compute_style("div", Some("overflow:scroll"));
+        assert_eq!(scroll.overflow_css_x, 3);
+        assert_eq!(scroll.overflow_css_y, 3);
+
+        let clip = compute_style("div", Some("overflow:clip"));
+        assert_eq!(clip.overflow_css_x, 1);
+        assert_eq!(clip.overflow_css_y, 1);
+
+        // Coupling: `visible` paired with a scrollable axis computes to
+        // `auto`, and `clip` paired with a scrollable axis computes to
+        // `hidden` (CSS Overflow Module Level 3).
+        let coupled_visible = compute_style("div", Some("overflow-x:hidden;overflow-y:visible"));
+        assert_eq!(coupled_visible.overflow_css_x, 2);
+        assert_eq!(coupled_visible.overflow_css_y, 4);
+
+        let coupled_clip = compute_style("div", Some("overflow-x:scroll;overflow-y:clip"));
+        assert_eq!(coupled_clip.overflow_css_x, 3);
+        assert_eq!(coupled_clip.overflow_css_y, 2);
     }
 
     #[test]

@@ -15791,6 +15791,90 @@ mod tests {
     }
 
     #[test]
+    fn test_node_prototype_extends_event_target() {
+        // R-09: ShadyDOM/Polymer feature-detects the environment via
+        // `Node.prototype instanceof EventTarget` before grabbing native
+        // addEventListener/removeEventListener/dispatchEvent references. Node
+        // must be a real EventTarget subclass (not merely reimplement the same
+        // three methods) for that detection to take the "native" branch.
+        let mut rt = setup_runtime(r#"<button id="go">Go</button>"#);
+        let result = rt
+            .evaluate(
+                r#"
+            return {
+                nodeProtoInstanceofEventTarget: Node.prototype instanceof EventTarget,
+                elementInstanceofEventTarget: document.getElementById('go') instanceof EventTarget,
+                addEventListenerIdentityMatches:
+                    EventTarget.prototype.addEventListener === Node.prototype.addEventListener,
+                // In a real browser, addEventListener/removeEventListener/
+                // dispatchEvent live only on EventTarget.prototype and are
+                // inherited, not redefined, by Node.prototype.
+                nodeProtoOwnsAddEventListener: Node.prototype.hasOwnProperty('addEventListener'),
+                eventTargetProtoOwnsAddEventListener: EventTarget.prototype.hasOwnProperty('addEventListener'),
+            };
+        "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "nodeProtoInstanceofEventTarget": true,
+                "elementInstanceofEventTarget": true,
+                "addEventListenerIdentityMatches": true,
+                "nodeProtoOwnsAddEventListener": false,
+                "eventTargetProtoOwnsAddEventListener": true,
+            })
+        );
+    }
+
+    #[test]
+    fn test_event_target_environment_detection_pattern_used_by_shadydom() {
+        // Reproduces the actual detection/assignment gate from youtube.com's
+        // shipped ShadyDOM bundle (webcomponents-sd.js, functions `E`/`ab`):
+        // it copies addEventListener/removeEventListener/dispatchEvent onto
+        // `__shady_native_*` own properties of `window.EventTarget.prototype`,
+        // then reads `window.__shady_native_addEventListener` -- relying on
+        // `window` inheriting from `EventTarget.prototype` -- to decide
+        // whether a `Window.prototype`-only fallback copy is also needed.
+        // Before Window was linked into the EventTarget chain, that read
+        // always saw `undefined`, the fallback copy found nothing on
+        // `Window.prototype` (a no-op, since `E` only copies existing own
+        // properties) and `window.__shady_native_addEventListener` was left
+        // undefined -- exactly the reported
+        // `window.__shady_native_addEventListener is not a function`.
+        let mut rt = setup_runtime(r#"<button id="go">Go</button>"#);
+        let result = rt
+            .evaluate(
+                r#"
+            const names = ['dispatchEvent', 'addEventListener', 'removeEventListener'];
+            function E(a, list) {
+                for (const name of list) {
+                    const d = Object.getOwnPropertyDescriptor(a, name);
+                    if (d) Object.defineProperty(a, '__shady_native_' + name, d);
+                }
+            }
+            if (window.EventTarget) {
+                E(window.EventTarget.prototype, names);
+                if (window.__shady_native_addEventListener === void 0) {
+                    E(window.Window.prototype, names);
+                }
+            } else {
+                E(Node.prototype, names);
+                E(window.Window.prototype, names);
+            }
+            // The actual crash site: ShadyDOM calls this directly on window.
+            const button = document.getElementById('go');
+            let fired = false;
+            window.__shady_native_addEventListener.call(button, 'click', () => { fired = true; });
+            button.click();
+            return fired;
+        "#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!(true));
+    }
+
+    #[test]
     fn test_location_href_assignment_updates_navigation_state() {
         let mut rt = setup_runtime("<html><body></body></html>");
         let href = rt

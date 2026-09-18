@@ -745,11 +745,9 @@ function _getFp() {
   return _fpCache;
 }
 function _fp(key) { return _getFp()[key]; }
-globalThis._eventRegistry = globalThis._eventRegistry || {};
 globalThis._formValues = globalThis._formValues || {};
 globalThis._formChecked = globalThis._formChecked || {};
 globalThis._formIndeterminate = globalThis._formIndeterminate || {};
-const _eventRegistry = globalThis._eventRegistry;
 const _formValues = globalThis._formValues;
 const _formChecked = globalThis._formChecked;
 const _formIndeterminate = globalThis._formIndeterminate;
@@ -2124,7 +2122,25 @@ function _seedUnchangedConnection(node, connected) {
   node._treeConnectedEpoch = _treeMutationEpoch;
 }
 
-class Node {
+// EventTarget is the real base of the Node hierarchy (and of standalone
+// listener targets such as AbortSignal-less framework schedulers). Node
+// extends it below instead of redefining addEventListener/removeEventListener
+// /dispatchEvent itself, so that `Node.prototype instanceof EventTarget` and
+// `x.addEventListener === EventTarget.prototype.addEventListener` hold the
+// way polyfills (ShadyDOM/Polymer among them) expect when feature-detecting
+// the environment.
+class EventTarget {
+  addEventListener(type, callback, options) {
+    _eventTargetAdd(this, type, callback, options);
+  }
+  removeEventListener(type, callback, options) {
+    _eventTargetRemove(this, type, callback, options);
+  }
+  dispatchEvent(event) {
+    return _eventTargetDispatch(this, event);
+  }
+}
+class Node extends EventTarget {
   static ELEMENT_NODE = 1;
   static ATTRIBUTE_NODE = 2;
   static TEXT_NODE = 3;
@@ -2144,7 +2160,7 @@ class Node {
   static DOCUMENT_POSITION_CONTAINED_BY = 16;
   static DOCUMENT_POSITION_IMPLEMENTATION_SPECIFIC = 32;
 
-  constructor(nid) { this._nid = nid; }
+  constructor(nid) { super(); this._nid = nid; }
   get nodeType() { return +_dom("node_type", this._nid); }
   get nodeName() { return _domParse("node_name", this._nid) || ""; }
   get ownerDocument() { return globalThis.document; }
@@ -2471,15 +2487,6 @@ class Node {
     return true;
   }
   isSameNode(other) { return !!other && this._nid === other._nid; }
-  addEventListener(type, callback, options) {
-    _eventTargetAdd(this, type, callback, options);
-  }
-  removeEventListener(type, callback, options) {
-    _eventTargetRemove(this, type, callback, options);
-  }
-  dispatchEvent(event) {
-    return _eventTargetDispatch(this, event);
-  }
 }
 class CharacterData extends Node {
   get data() {
@@ -3777,18 +3784,16 @@ class Element extends Node {
     }
     return null;
   }
-  addEventListener(type, handler, opts) {
-    const key = this._nid;
-    if (!_eventRegistry[key]) _eventRegistry[key] = {};
-    if (!_eventRegistry[key][type]) _eventRegistry[key][type] = [];
-    _eventRegistry[key][type].push(handler);
-  }
-  removeEventListener(type, handler) {
-    const key = this._nid;
-    if (_eventRegistry[key] && _eventRegistry[key][type]) {
-      _eventRegistry[key][type] = _eventRegistry[key][type].filter(h => h !== handler);
-    }
-  }
+  // addEventListener/removeEventListener are inherited from EventTarget (via
+  // Node) rather than redefined here. Element used to keep a parallel
+  // `_eventRegistry` store with its own addEventListener/removeEventListener,
+  // which made `element.addEventListener !== EventTarget.prototype.addEventListener`
+  // -- exactly the prototype-chain shape ShadyDOM/Polymer's environment
+  // detection (and any other code that captures the "native" EventTarget
+  // methods to wrap) relies on being identical. dispatchEvent stays
+  // overridden only for element-specific concerns spec doesn't put on
+  // EventTarget itself: inline `onclick="..."` content attributes / IDL
+  // handler properties, and bubbling to parentNode.
   dispatchEvent(event) {
     if (!event) return true;
     if (!event.target) event.target = this;
@@ -3807,11 +3812,7 @@ class Element extends Node {
         if (ret === false) event.preventDefault();
       } catch(e) { console.error(e); }
     }
-    const handlers = (_eventRegistry[this._nid] || {})[event.type] || [];
-    for (const h of handlers) {
-      try { h.call(this, event); } catch(e) { console.error(e); }
-      if (event._immediatePropagationStopped) break;
-    }
+    _eventTargetDispatch(this, event);
     if (event.bubbles && !event._propagationStopped && this.parentNode) {
       this.parentNode.dispatchEvent(event);
     }
@@ -6799,6 +6800,18 @@ Object.defineProperty(globalThis.Window, Symbol.hasInstance, {
   value(obj) { return obj === globalThis || (obj && obj.window === obj); },
   configurable: true,
 });
+// Per spec, Window extends EventTarget, so `window instanceof EventTarget` is
+// true and inherited-property lookups on `window` reach EventTarget.prototype.
+// ShadyDOM/Polymer's environment probe depends on exactly that: it assigns
+// `__shady_native_addEventListener` as an own property of
+// `window.EventTarget.prototype`, then reads `window.__shady_native_addEventListener`
+// to see whether that assignment is reachable from `window` through
+// inheritance. Without this link the read always sees `undefined`, the probe
+// falls through to a `Window.prototype`-only fallback that never gets an
+// addEventListener of its own, and `window.__shady_native_addEventListener`
+// stays undefined -- the exact crash reported on youtube.com.
+Object.setPrototypeOf(globalThis.Window.prototype, EventTarget.prototype);
+Object.setPrototypeOf(globalThis, globalThis.Window.prototype);
 // A browser global is a Window object, not merely an object accepted by
 // `Window[Symbol.hasInstance]`. Framework environment gates (including Ember's)
 // also require the direct identity `self.constructor === Window`; leaving the
@@ -12118,7 +12131,7 @@ for (const _proto of [Document.prototype, DocumentFragment.prototype]) {
   _proto.prepend = Element.prototype.prepend;
   _proto.replaceChildren = Element.prototype.replaceChildren;
 }
-globalThis.EventTarget = Node;
+globalThis.EventTarget = EventTarget;
 globalThis.HTMLCollection = class HTMLCollection extends Array {
   item(i) {
     i = i >>> 0;

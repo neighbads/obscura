@@ -15560,6 +15560,33 @@ mod tests {
         }
     }
 
+    /// Regression: node wrapping used to resolve element classes off
+    /// `globalThis` at wrap time, so a page that replaces `window.HTMLElement`
+    /// broke every subsequent wrap. YouTube's custom-elements-es5-adapter does
+    /// exactly that -- its replacement only works when invoked from a
+    /// registered custom element's constructor -- so `document.querySelectorAll`
+    /// threw "TypeError: a is not a constructor" and Playwright could not
+    /// locate anything on the page.
+    #[test]
+    fn element_wrapping_survives_a_page_replacing_window_html_element() {
+        let mut rt = setup_runtime(r#"<div id="d"></div><my-widget id="w"></my-widget>"#);
+        let result = rt
+            .evaluate(
+                r#"
+                const notAConstructor = Math.random; // callable, but `new` throws
+                globalThis.HTMLElement = notAConstructor;
+                // Parse fresh nodes *after* the override so they have never
+                // been wrapped and cached; this is the path YouTube hit.
+                document.body.innerHTML = "<div id=fresh></div><my-widget></my-widget>";
+                const all = document.querySelectorAll('#fresh, my-widget');
+                return [all.length, all[0].tagName, all[1].tagName,
+                        document.createElement("section").tagName];
+                "#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!([2, "DIV", "MY-WIDGET", "SECTION"]));
+    }
+
     /// Regression for R-09: `sandbox` used to be a getter-only accessor on
     /// the shared `Element` base class, so `el.sandbox = x` threw
     /// `TypeError: Cannot set property sandbox of #<Element> which has only

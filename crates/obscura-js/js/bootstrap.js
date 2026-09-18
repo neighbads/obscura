@@ -6665,6 +6665,15 @@ const _htmlTagElementClasses = {
   TFOOT: "HTMLTableSectionElement",
 };
 
+// Snapshot of our own DOM interface constructors, filled in at the end of
+// bootstrap once every class exists. Element wrapping must resolve through
+// this table and not through `globalThis`, because a page is allowed to
+// replace those globals: YouTube's custom-elements-es5-adapter overwrites
+// `window.HTMLElement` with a shim that only works when invoked from a
+// registered custom element's constructor, so wrapping an ordinary node with
+// it throws "TypeError: a is not a constructor" and kills querySelectorAll.
+const _nativeElementClasses = Object.create(null);
+
 function _elementClassFor(nid) {
   const tag = _domParse("tag_name", nid);
   // HTML tagName values are ASCII-uppercase. Foreign SVG names retain their
@@ -6672,51 +6681,51 @@ function _elementClassFor(nid) {
   // namespace for possible SVG wrappers.
   if (tag && tag !== tag.toUpperCase()
       && _domParse("namespace_uri", nid) === "http://www.w3.org/2000/svg") {
-    if (tag === "path" && globalThis.SVGPathElement) return globalThis.SVGPathElement;
-    if (tag === "svg" && globalThis.SVGSVGElement) return globalThis.SVGSVGElement;
-    if (globalThis.SVGElement) return globalThis.SVGElement;
+    if (tag === "path" && _nativeElementClasses.SVGPathElement) return _nativeElementClasses.SVGPathElement;
+    if (tag === "svg" && _nativeElementClasses.SVGSVGElement) return _nativeElementClasses.SVGSVGElement;
+    if (_nativeElementClasses.SVGElement) return _nativeElementClasses.SVGElement;
   }
-  if (tag === "FORM" && globalThis.HTMLFormElement) return globalThis.HTMLFormElement;
-  if (tag === "TEXTAREA" && globalThis.HTMLTextAreaElement) return globalThis.HTMLTextAreaElement;
+  if (tag === "FORM" && _nativeElementClasses.HTMLFormElement) return _nativeElementClasses.HTMLFormElement;
+  if (tag === "TEXTAREA" && _nativeElementClasses.HTMLTextAreaElement) return _nativeElementClasses.HTMLTextAreaElement;
   // Only HTML slots take part in slot assignment; a foreign-namespace "SLOT"
   // (createElementNS + cloneNode lands here) stays a plain Element.
-  if (tag === "SLOT" && globalThis.HTMLSlotElement
+  if (tag === "SLOT" && _nativeElementClasses.HTMLSlotElement
       && _domParse("namespace_uri", nid) === "http://www.w3.org/1999/xhtml") {
-    return globalThis.HTMLSlotElement;
+    return _nativeElementClasses.HTMLSlotElement;
   }
   if (tag === "IMG") return HTMLImageElement;
-  if (tag === "CANVAS" && globalThis.HTMLCanvasElement) return globalThis.HTMLCanvasElement;
+  if (tag === "CANVAS" && _nativeElementClasses.HTMLCanvasElement) return _nativeElementClasses.HTMLCanvasElement;
   if (tag === "AUDIO") return HTMLAudioElement;
   if (tag === "VIDEO") return HTMLVideoElement;
   if (tag === "TRACK") return HTMLTrackElement;
-  if (tag === "IFRAME" && globalThis.HTMLIFrameElement) return globalThis.HTMLIFrameElement;
+  if (tag === "IFRAME" && _nativeElementClasses.HTMLIFrameElement) return _nativeElementClasses.HTMLIFrameElement;
   const mapped = _htmlTagElementClasses[tag];
-  if (mapped && globalThis[mapped]) return globalThis[mapped];
-  return globalThis.HTMLElement || Element;
+  if (mapped && _nativeElementClasses[mapped]) return _nativeElementClasses[mapped];
+  return _nativeElementClasses.HTMLElement || Element;
 }
 function _elementClassForKnownName(namespace, qualifiedName) {
   const localName = qualifiedName.includes(":")
     ? qualifiedName.slice(qualifiedName.indexOf(":") + 1)
     : qualifiedName;
   if (namespace === "http://www.w3.org/2000/svg") {
-    if (localName === "path" && globalThis.SVGPathElement) return globalThis.SVGPathElement;
-    if (localName === "svg" && globalThis.SVGSVGElement) return globalThis.SVGSVGElement;
-    if (globalThis.SVGElement) return globalThis.SVGElement;
+    if (localName === "path" && _nativeElementClasses.SVGPathElement) return _nativeElementClasses.SVGPathElement;
+    if (localName === "svg" && _nativeElementClasses.SVGSVGElement) return _nativeElementClasses.SVGSVGElement;
+    if (_nativeElementClasses.SVGElement) return _nativeElementClasses.SVGElement;
   }
   if (namespace === "http://www.w3.org/1999/xhtml") {
     const tag = localName.toUpperCase();
-    if (tag === "FORM" && globalThis.HTMLFormElement) return globalThis.HTMLFormElement;
-    if (tag === "TEXTAREA" && globalThis.HTMLTextAreaElement) return globalThis.HTMLTextAreaElement;
-    if (tag === "SLOT" && globalThis.HTMLSlotElement) return globalThis.HTMLSlotElement;
+    if (tag === "FORM" && _nativeElementClasses.HTMLFormElement) return _nativeElementClasses.HTMLFormElement;
+    if (tag === "TEXTAREA" && _nativeElementClasses.HTMLTextAreaElement) return _nativeElementClasses.HTMLTextAreaElement;
+    if (tag === "SLOT" && _nativeElementClasses.HTMLSlotElement) return _nativeElementClasses.HTMLSlotElement;
     if (tag === "IMG") return HTMLImageElement;
-    if (tag === "CANVAS" && globalThis.HTMLCanvasElement) return globalThis.HTMLCanvasElement;
+    if (tag === "CANVAS" && _nativeElementClasses.HTMLCanvasElement) return _nativeElementClasses.HTMLCanvasElement;
     if (tag === "AUDIO") return HTMLAudioElement;
     if (tag === "VIDEO") return HTMLVideoElement;
     if (tag === "TRACK") return HTMLTrackElement;
-    if (tag === "IFRAME" && globalThis.HTMLIFrameElement) return globalThis.HTMLIFrameElement;
+    if (tag === "IFRAME" && _nativeElementClasses.HTMLIFrameElement) return _nativeElementClasses.HTMLIFrameElement;
     const mapped = _htmlTagElementClasses[tag];
-    if (mapped && globalThis[mapped]) return globalThis[mapped];
-    if (globalThis.HTMLElement) return globalThis.HTMLElement;
+    if (mapped && _nativeElementClasses[mapped]) return _nativeElementClasses[mapped];
+    if (_nativeElementClasses.HTMLElement) return _nativeElementClasses.HTMLElement;
   }
   return Element;
 }
@@ -16612,6 +16621,19 @@ if (typeof Response !== 'undefined' && Response.prototype && !Response.prototype
     var val;
     try { val = globalThis[name]; } catch (e) { continue; }
     if (typeof val === 'function') { walk(val); }
+  }
+})();
+
+// Freeze the element-class table now that every interface above is defined.
+// See the comment on `_nativeElementClasses`: reading these off `globalThis`
+// at wrap time lets a page's override break node wrapping engine-wide.
+(function () {
+  const names = ["HTMLElement", "SVGElement", "SVGSVGElement", "SVGPathElement",
+    "HTMLFormElement", "HTMLTextAreaElement", "HTMLSlotElement",
+    "HTMLCanvasElement", "HTMLIFrameElement"];
+  for (const tag in _htmlTagElementClasses) names.push(_htmlTagElementClasses[tag]);
+  for (const name of names) {
+    if (typeof globalThis[name] === "function") _nativeElementClasses[name] = globalThis[name];
   }
 })();
 

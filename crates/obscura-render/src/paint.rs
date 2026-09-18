@@ -14904,10 +14904,13 @@ mod tests {
         assert!(scaled_box.red() > 220 && scaled_box.green() < 40);
         let scaled_image = pixmap.pixel(110, 70).expect("scaled image");
         assert!(scaled_image.green() > 220 && scaled_image.red() < 40);
+        // The span authors its own color (#0000ff); once R-08 stops dropping
+        // that override, the rasterized glyphs are blue, not black, so look
+        // for the authored color rather than an arbitrary dark pixel.
         assert!(
             (20..100).any(|x| (20..60).any(|y| {
                 let pixel = pixmap.pixel(x, y).expect("scaled text region");
-                pixel.red() < 80 && pixel.green() < 80 && pixel.blue() < 80
+                pixel.blue() > 150 && pixel.red() < 150 && pixel.green() < 100
             })),
             "text must be rasterized inside the scaled atomic subtree"
         );

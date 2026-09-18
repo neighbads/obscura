@@ -9825,6 +9825,69 @@ fn is_flattenable_inline(
         && style.position.is_none()
         && !style.overflow_hidden
         && style.float.is_none()
+        // Flattening deletes this node from the tree, so a text-affecting
+        // property (color, font-size, ...) that resolves *differently* on
+        // this element than on its parent must also block flattening:
+        // `collect_node_spans`/`build_text_words` thread those per-element,
+        // and a removed element can no longer contribute its own override
+        // (github.com's `<b style="color:red">` rendering in the inherited
+        // color instead, issue R-08). These fields carry the fully-inherited
+        // value (UA defaults and ancestor inheritance already baked in, not
+        // just this element's own declarations), so comparing against `None`
+        // would block flattening for nearly every element on any page with a
+        // global `font`/`color` rule; comparing against the parent's already
+        // -resolved value isolates exactly the elements whose own cascade
+        // step actually changes the rendered text, which is what removing
+        // them from the tree would actually lose.
+        && !has_own_text_style_override(tree, id, style, styles)
+}
+
+/// Does `id`'s resolved text-affecting style differ from its parent's, i.e.
+/// does *this* element's own declarations (as opposed to inheritance) change
+/// how its text renders? See `is_flattenable_inline` for why comparing
+/// against `None` is wrong for these fields.
+fn has_own_text_style_override(
+    tree: &DomTree,
+    id: NodeId,
+    style: &crate::LayoutStyle,
+    styles: &HashMap<NodeId, crate::LayoutStyle>,
+) -> bool {
+    let Some(parent_style) = tree
+        .get_node(id)
+        .and_then(|node| node.parent)
+        .and_then(|pid| styles.get(&pid))
+    else {
+        // No resolved parent style to compare against: be conservative and
+        // treat any declared text styling as an override.
+        return style.color.is_some()
+            || style.font_size.is_some()
+            || style.font_family.is_some()
+            || style.font_weight.is_some()
+            || style.font_style_italic.is_some()
+            || style.letter_spacing.is_some()
+            || style.font_optical_sizing.is_some()
+            || style.white_space.is_some()
+            || style.overflow_wrap.is_some()
+            || style.word_break.is_some()
+            || style.text_transform.is_some()
+            || style.underline.is_some()
+            || style.overline.is_some()
+            || style.line_through.is_some();
+    };
+    style.color != parent_style.color
+        || style.font_size != parent_style.font_size
+        || style.font_family != parent_style.font_family
+        || style.font_weight != parent_style.font_weight
+        || style.font_style_italic != parent_style.font_style_italic
+        || style.letter_spacing != parent_style.letter_spacing
+        || style.font_optical_sizing != parent_style.font_optical_sizing
+        || style.white_space != parent_style.white_space
+        || style.overflow_wrap != parent_style.overflow_wrap
+        || style.word_break != parent_style.word_break
+        || style.text_transform != parent_style.text_transform
+        || style.underline != parent_style.underline
+        || style.overline != parent_style.overline
+        || style.line_through != parent_style.line_through
 }
 
 /// Split a text node into one taffy leaf per word (a whitespace-delimited
@@ -18895,6 +18958,30 @@ mod tests {
         assert!(
             sibling_rect.x + 0.01 >= box_rect.x + box_rect.width,
             "the CTA sibling must not overlap the shrink-to-fit box: sibling={sibling_rect:?} box={box_rect:?}"
+        );
+    }
+
+    #[test]
+    fn inline_wrapper_with_own_text_style_is_not_flattened() {
+        // `flatten_boxless_inline_children` (via `is_flattenable_inline`)
+        // removes a plain inline wrapper like `<b>` from the effective child
+        // list and recurses straight into its children, so a mixed block
+        // (one with a block-level sibling, forcing `build_mixed_block`'s
+        // run/atoms path instead of the whole-container `try_build`) threads
+        // styles per surviving node via `collect_node_spans`. A wrapper that
+        // carries its own color/font-size has nowhere to attach that
+        // override once it is deleted from the tree: the fallback context
+        // silently falls back to the parent's inherited style (R-08 — a
+        // `<b style="color:red;font-size:32px">` rendered in the default
+        // color and size next to a block sibling).
+        let tree = parse_html(
+            r#"<body><b id="b" style="color:red;font-size:32px">Login</b><br><br><div>hi</div></body>"#,
+        );
+        let laid = layout_dom(&tree, (800.0, 600.0));
+        let b = tree.get_element_by_id("b").unwrap();
+        assert!(
+            !is_flattenable_inline(&tree, b, &laid.styles),
+            "an inline wrapper with its own color/font-size override must not be flattened away"
         );
     }
 

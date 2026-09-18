@@ -5740,6 +5740,90 @@ mod tests {
         }
     }
 
+    // R-13 — performance.mark()/measure() were no-ops and getEntries* always
+    // returned []. Sites that gate SPA initialization on "mark a checkpoint,
+    // then getEntriesByName it back" (Dropbox's registration flow) got
+    // `undefined` from the previous stub and never progressed.
+    #[test]
+    fn performance_mark_returns_a_shaped_entry_and_is_retrievable() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(function(){
+                    var m = performance.mark("checkpoint");
+                    var byName = performance.getEntriesByName("checkpoint");
+                    var byType = performance.getEntriesByType("mark");
+                    return [
+                        m.name, m.entryType, typeof m.startTime, m.duration,
+                        byName.length, byName[0].name,
+                        byType.length, byType[0].name,
+                    ];
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!(["checkpoint", "mark", "number", 0, 1, "checkpoint", 1, "checkpoint"])
+        );
+    }
+
+    #[test]
+    fn performance_measure_computes_duration_between_two_marks() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(function(){
+                    performance.mark("start");
+                    var end = performance.now() + 5;
+                    while (performance.now() < end) {}
+                    performance.mark("end");
+                    var measure = performance.measure("span", "start", "end");
+                    var byType = performance.getEntriesByType("measure");
+                    return [measure.name, measure.entryType, measure.duration >= 0, byType.length];
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!(["span", "measure", true, 1]));
+    }
+
+    #[test]
+    fn performance_measure_with_unknown_mark_throws_syntax_error() {
+        // evaluate()'s wrapper answers a thrown exception with `null` (#746),
+        // so catch in-script and report the error's shape instead.
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(function(){
+                    try {
+                        performance.measure("x", "does-not-exist");
+                        return "no-throw";
+                    } catch (e) {
+                        return [e.name, e.message.indexOf("does-not-exist") !== -1];
+                    }
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!(["SyntaxError", true]));
+    }
+
+    #[test]
+    fn performance_clear_marks_and_get_entries_reflect_removal() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(function(){
+                    performance.mark("a");
+                    performance.mark("b");
+                    performance.clearMarks("a");
+                    var names = performance.getEntries().map(function(e){return e.name;});
+                    performance.clearMarks();
+                    return [names, performance.getEntries().length];
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!([["b"], 0]));
+    }
+
     #[test]
     fn childnode_helpers_coerce_non_string_primitives_to_text() {
         let mut rt =

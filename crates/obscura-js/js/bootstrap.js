@@ -10808,6 +10808,26 @@ globalThis.XMLSerializer = class XMLSerializer {
     return "";
   }
 };
+// Backing store for performance.mark()/measure(): sites that gate SPA
+// initialization on "mark a checkpoint, then getEntriesByName it back" (e.g.
+// Dropbox's registration flow) got `undefined` from the previous no-op stubs
+// and never progressed past that check.
+let __perfEntries = [];
+
+function _perfResolveMarkTime(ref, method) {
+  if (typeof ref === "number") return ref;
+  const name = String(ref);
+  // Per spec: the most recently created entry with this name, mark or
+  // measure alike.
+  for (let i = __perfEntries.length - 1; i >= 0; i--) {
+    if (__perfEntries[i].name === name) return __perfEntries[i].startTime;
+  }
+  throw new DOMException(
+    "Failed to execute '" + method + "' on 'Performance': The mark '" + name + "' does not exist.",
+    "SyntaxError"
+  );
+}
+
 globalThis.performance = globalThis.performance || {
   now: (function() {
     // Monotonically non-decreasing: return the wall-clock offset, but never a
@@ -10822,9 +10842,59 @@ globalThis.performance = globalThis.performance || {
       return _last;
     };
   })(),
-  mark(){}, measure(){},
-  clearMarks(){}, clearMeasures(){}, clearResourceTimings(){},
-  getEntries(){return [];}, getEntriesByName(){return [];}, getEntriesByType(){return [];},
+  mark(name, options) {
+    name = String(name);
+    const startTime = (options && options.startTime != null) ? options.startTime : globalThis.performance.now();
+    const entry = {
+      name,
+      entryType: "mark",
+      startTime,
+      duration: 0,
+      detail: (options && options.detail !== undefined) ? options.detail : null,
+    };
+    __perfEntries.push(entry);
+    return entry;
+  },
+  measure(name, startOrOptions, endMark) {
+    name = String(name);
+    let start, end, detail = null;
+    if (startOrOptions !== null && typeof startOrOptions === "object") {
+      detail = startOrOptions.detail !== undefined ? startOrOptions.detail : null;
+      start = startOrOptions.start !== undefined ? _perfResolveMarkTime(startOrOptions.start, "measure") : 0;
+      if (startOrOptions.end !== undefined) {
+        end = _perfResolveMarkTime(startOrOptions.end, "measure");
+      } else if (startOrOptions.duration !== undefined) {
+        end = start + startOrOptions.duration;
+      } else {
+        end = globalThis.performance.now();
+      }
+    } else {
+      start = startOrOptions !== undefined ? _perfResolveMarkTime(startOrOptions, "measure") : 0;
+      end = endMark !== undefined ? _perfResolveMarkTime(endMark, "measure") : globalThis.performance.now();
+    }
+    const entry = { name, entryType: "measure", startTime: start, duration: end - start, detail };
+    __perfEntries.push(entry);
+    return entry;
+  },
+  clearMarks(name) {
+    __perfEntries = __perfEntries.filter((e) => !(e.entryType === "mark" && (name === undefined || e.name === String(name))));
+  },
+  clearMeasures(name) {
+    __perfEntries = __perfEntries.filter((e) => !(e.entryType === "measure" && (name === undefined || e.name === String(name))));
+  },
+  clearResourceTimings(){},
+  getEntries() {
+    return __perfEntries.slice().sort((a, b) => a.startTime - b.startTime);
+  },
+  getEntriesByName(name, type) {
+    name = String(name);
+    return __perfEntries
+      .filter((e) => e.name === name && (type === undefined || e.entryType === type))
+      .sort((a, b) => a.startTime - b.startTime);
+  },
+  getEntriesByType(type) {
+    return __perfEntries.filter((e) => e.entryType === type).sort((a, b) => a.startTime - b.startTime);
+  },
   setResourceTimingBufferSize(){},
   timeOrigin: 0,
   timing: { navigationStart: 0, domContentLoadedEventEnd: 0, loadEventEnd: 0 },

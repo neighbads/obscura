@@ -23,6 +23,39 @@ Use `cargo nextest`, not `cargo test`. Runtime tests require process isolation
 because the engine owns one V8 isolate per process. Render tests must run in
 release mode; debug builds are not a fidelity or performance gate.
 
+`--features render` only resolves against the workspace root or a crate that
+defines it: `obscura`, `obscura-cli`, `obscura-browser`, `obscura-js`,
+`obscura-cdp`, `obscura-mcp`. Combining it with `-p <crate>` for any other crate
+fails with *"the package does not contain this feature"*. `obscura-render`
+defines only `paint`:
+
+```bash
+cargo nextest run --release --features paint -p obscura-render --no-fail-fast
+```
+
+To scope by crate while still enabling `render`, filter instead of narrowing the
+package:
+
+```bash
+cargo nextest run --release --features render -E 'package(obscura-net)' --no-fail-fast
+```
+
+### Taking a regression baseline
+
+Test counts change with every commit, so compare against a baseline you take
+yourself rather than a number recorded elsewhere:
+
+```bash
+git checkout <base commit>
+cargo nextest run --release --features render --no-fail-fast   # note the failures
+git checkout -
+cargo nextest run --release --features render --no-fail-fast   # compare line by line
+```
+
+Passing count should equal the baseline plus the tests you added, and the
+failure list should match the baseline exactly. One extra failure is a
+regression; do not explain it away.
+
 ### CDP parity tests
 
 `crates/obscura-cdp/tests/cdp_*.rs` exercise CDP methods end-to-end with a real `dispatch` call and an in-process HTTP server.
@@ -97,6 +130,34 @@ Two pages tried to use V8 concurrently. The `v8_lock` was bypassed, or a handler
 ### Test hangs
 
 A handler is awaiting something that never resolves. Run with `RUST_LOG=obscura=trace` and check the last log line before the hang.
+
+If many tests hang or panic at once, check the TLS trust store first (below).
+
+### `InvalidCertificate(BadEncoding)`, or network tests hanging en masse
+
+```
+failed to build HTTP client: reqwest::Error { kind: Builder, source: InvalidCertificate(BadEncoding) }
+```
+
+rustls cannot parse OpenSSL's `TRUSTED CERTIFICATE` format. If the system trust
+store exposes such a file — `ca-bundle.trust.crt` is the usual culprit — the
+client builder in `crates/obscura-net/src/client.rs` fails, every test that
+builds an HTTP client panics, and network-dependent tests hang.
+
+This looks exactly like a machine with no network, but it is not: the failure is
+at certificate *parse* time, and configuring a proxy changes nothing. Do not
+filter these tests out — doing so hides real regressions in `obscura-cdp` and
+`obscura-net`.
+
+Point `SSL_CERT_FILE` / `SSL_CERT_DIR` at a bundle containing only
+`BEGIN CERTIFICATE` blocks. Most distributions ship a plain PEM bundle
+elsewhere; otherwise extract one:
+
+```bash
+awk '/BEGIN CERTIFICATE/,/END CERTIFICATE/' <system bundle> > <clean bundle>
+export SSL_CERT_FILE=<clean bundle>
+export SSL_CERT_DIR=$(dirname <clean bundle>)
+```
 
 ## Reproducing user bug reports
 

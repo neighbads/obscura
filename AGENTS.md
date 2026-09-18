@@ -63,6 +63,13 @@ Check the crate's own `Cargo.toml` `[features]` before passing `--features` with
 single V8 isolate per process, so the runtime tests fail under it. `nextest`
 runs each test in its own process, which is the only supported way.
 
+If a broad swathe of tests panics with `InvalidCertificate(BadEncoding)` or
+hangs on network access, read the TLS trust store section of
+[Testing and debugging](docs/Testing-and-debugging.md) before concluding the
+machine has no network — it is usually a certificate *format* problem, and
+filtering the tests out hides real regressions. That page also covers how to
+take your own regression baseline.
+
 The authoritative behavioral gate is the **obstacle course** in the companion
 repo `obscura-benchmark` (33 capability + speed stages, must stay 33/33):
 

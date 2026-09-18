@@ -1219,20 +1219,16 @@ impl PreparedRender {
             inherited: Option<crate::dom::OverflowClip>,
             out: &mut [Option<crate::dom::OverflowClip>],
         ) {
-            // A fixed-position box whose containing block is the viewport
-            // escapes clips established by ancestors in document space. Only
-            // reset at the boundary: descendants still inherit clips created
-            // inside the fixed subtree, while transform/filter/contain-
-            // captured fixed boxes are absent from `viewport_fixed` and retain
-            // their ordinary ancestor clips.
-            let starts_viewport_fixed = viewport_fixed.contains(&id)
-                && crate::dom::rendered_parent(tree, id)
-                    .is_none_or(|parent| !viewport_fixed.contains(&parent));
-            let inherited = if starts_viewport_fixed {
-                None
-            } else {
-                inherited
-            };
+            // A fixed-position box's containing block is the viewport, but
+            // that only changes how its own offset is computed (see
+            // `movement`/`movement_owner` above): CSS clipping is independent
+            // of positioning. A DOM ancestor's `overflow: hidden` still clips
+            // a `position: fixed` descendant, and that clip rect moves with
+            // the ancestor as the page scrolls -- the "scroll reveal" effect
+            // used by e.g. github.com's hero section. So `inherited` passes
+            // through the viewport-fixed boundary unchanged; clips created
+            // inside the fixed subtree keep applying to its descendants via
+            // the ordinary `next` computation below regardless.
             if let Some(slot) = out.get_mut(id.index()) {
                 *slot = inherited.clone();
             }
@@ -16462,7 +16458,7 @@ mod tests {
     }
 
     #[test]
-    fn viewport_fixed_descendant_escapes_nested_scrollport_clip_in_all_paint_paths() {
+    fn viewport_fixed_descendant_ordinary_ancestor_clip_still_applies() {
         let tree = parse_html(
             r#"<html style="margin:0"><body style="margin:0">
                 <div id="scroller" style="position:relative;width:100px;height:80px;
@@ -16495,12 +16491,20 @@ mod tests {
         assert!(prepared.viewport_fixed_nodes().contains(&fixed));
         assert!(!prepared.viewport_fixed_nodes().contains(&captured_fixed));
 
+        // NOTE: the default/live paint path (no `ResolvedScrollState`, backed
+        // by `viewport_fixed_clip_map`) still unconditionally clears the
+        // inherited clip at the viewport-fixed boundary -- the same
+        // conflation between positioning containing block and clipping
+        // ancestor chain that R-06 fixed in `resolve_clips` below. That
+        // sibling bug is out of scope here (`resolve_scroll_state_for_viewport`
+        // is what the real CDP screenshot path uses); this assertion just
+        // pins the current, unfixed behavior of the untouched path.
         let tuple = paint_prepared(&tree, &mut prepared, &mut resources, (0.0, 0.0))
             .expect("tuple paint");
         let tuple_pixel = tuple.pixel(155, 15).unwrap();
         assert!(
             tuple_pixel.green() > 240 && tuple_pixel.red() < 20 && tuple_pixel.blue() < 20,
-            "the default paint path retained the ancestor scroller clip: {tuple_pixel:?}",
+            "the default paint path still escapes the ancestor scroller clip: {tuple_pixel:?}",
         );
         let captured_pixel = tuple.pixel(155, 55).unwrap();
         assert!(
@@ -16519,19 +16523,25 @@ mod tests {
 
         let offsets = HashMap::from([(scroller, (0.0, 60.0))]);
         let scroll = prepared.resolve_scroll_state(&tree, (0.0, 0.0), &offsets);
+        // R-06: a `position: fixed` box's containing block is the viewport,
+        // but that does not exempt it from an ordinary DOM ancestor's
+        // `overflow: hidden`. `#fixed` (x:150-170) sits entirely outside
+        // `#scroller`'s border box (x:0-100), so the inherited clip must
+        // still apply and make it fully clipped.
         assert!(
-            scroll.inherited_clip_for(fixed).is_none(),
-            "a viewport-fixed boundary must clear document-space overflow clips",
+            scroll.inherited_clip_for(fixed).is_some(),
+            "an ordinary DOM ancestor's overflow:hidden must still clip a viewport-fixed descendant",
         );
         let resolved =
             paint_prepared_with_scroll(&tree, &mut prepared, &mut resources, &scroll)
                 .expect("resolved paint");
         let resolved_pixel = resolved.pixel(155, 15).unwrap();
         assert!(
-            resolved_pixel.green() > 240
-                && resolved_pixel.red() < 20
-                && resolved_pixel.blue() < 20,
-            "the resolved paint path retained the ancestor scroller clip: {resolved_pixel:?}",
+            resolved_pixel.red() > 240
+                && resolved_pixel.green() > 240
+                && resolved_pixel.blue() > 240,
+            "the resolved paint path must still clip the fixed descendant to the ancestor \
+             scroller's border box: {resolved_pixel:?}",
         );
         let captured_pixel = resolved.pixel(155, 55).unwrap();
         assert!(captured_pixel.red() > 240 && captured_pixel.green() > 240 && captured_pixel.blue() > 240);
@@ -16540,6 +16550,59 @@ mod tests {
             internal_clip_pixel.red() > 240
                 && internal_clip_pixel.green() > 240
                 && internal_clip_pixel.blue() > 240
+        );
+    }
+
+    // R-06 regression: github.com's homepage puts its fixed hero section
+    // inside a `position:relative; overflow:hidden` ancestor that scrolls
+    // with the document, so the hero disappears once the page is scrolled
+    // past it (the "scroll reveal" trick). Root/document scrolling -- not a
+    // local scroll container -- is exactly what `ensure_resolved_scroll`
+    // uses for the real CDP screenshot path.
+    #[test]
+    fn viewport_fixed_descendant_is_clipped_by_scrolling_ancestor_scroll_reveal() {
+        let tree = parse_html(
+            r#"<html style="margin:0"><body style="margin:0;height:1000px">
+                <div id="hero-wrap" style="position:relative;width:100px;height:80px;
+                     overflow:hidden;background:red">
+                    <div id="fixed" style="position:fixed;left:10px;top:10px;
+                         width:20px;height:20px;background:lime"></div>
+                </div>
+            </body></html>"#,
+        );
+        let fixed = tree.get_element_by_id("fixed").unwrap();
+        let mut resources = RenderResourceCache::with_loader(|_url: &str| None);
+        let mut prepared =
+            prepare_dom(&tree, (220.0, 100.0), None, &mut resources).expect("prepared");
+        assert!(prepared.viewport_fixed_nodes().contains(&fixed));
+
+        let top = prepared.resolve_scroll_state(&tree, (0.0, 0.0), &HashMap::new());
+        assert!(
+            top.inherited_clip_for(fixed).is_some(),
+            "the fixed hero must inherit its ancestor's overflow:hidden clip",
+        );
+        let top_paint =
+            paint_prepared_with_scroll(&tree, &mut prepared, &mut resources, &top)
+                .expect("top paint");
+        let top_pixel = top_paint.pixel(20, 20).unwrap();
+        assert!(
+            top_pixel.green() > 240 && top_pixel.red() < 20 && top_pixel.blue() < 20,
+            "at the top of the page the hero is still within its ancestor's clip: {top_pixel:?}",
+        );
+
+        // Scroll the document past the 80px-tall wrapper. The fixed hero's
+        // own screen position never moves, but the clip rect inherited from
+        // its scrolling ancestor moves up with the page, so the hero must
+        // now be fully clipped away instead of overlapping content below it.
+        let scrolled = prepared.resolve_scroll_state(&tree, (0.0, 90.0), &HashMap::new());
+        let scrolled_paint =
+            paint_prepared_with_scroll(&tree, &mut prepared, &mut resources, &scrolled)
+                .expect("scrolled paint");
+        let scrolled_pixel = scrolled_paint.pixel(20, 20).unwrap();
+        assert!(
+            scrolled_pixel.red() > 240 && scrolled_pixel.green() > 240 && scrolled_pixel.blue() > 240,
+            "scrolling past the ancestor must clip the still-fixed hero instead of letting it \
+             overlap content below: {scrolled_pixel:?}",
         );
     }
 

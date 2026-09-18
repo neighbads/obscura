@@ -866,10 +866,12 @@ mod tests {
 
     // Companion regression test: an element that genuinely is off-screen must
     // still be scrolled into view (the fix must not turn this into a no-op).
-    // The test build has no layout engine, so getBoundingClientRect() always
-    // reports the same stub rect (top:190, height:20); shrink the viewport
-    // below that via Emulation.setDeviceMetricsOverride so the stub rect is
-    // genuinely out of view.
+    // Render builds compute a real layout box, so an unstyled <button> lands
+    // near the top of the document (a couple of CSS pixels in) regardless of
+    // viewport size -- it would still be "visible" inside even a 100px-tall
+    // emulated viewport and the test wouldn't actually exercise the
+    // off-screen path. Position the button explicitly below the emulated
+    // viewport so its real box is genuinely out of view.
     #[tokio::test(flavor = "current_thread")]
     async fn scroll_into_view_if_needed_scrolls_an_offscreen_element() {
         let mut ctx = CdpContext::new();
@@ -881,7 +883,7 @@ mod tests {
             "navigate",
             &json!({
                 "url": "data:text/html,<body style='margin:0;height:2000px'>\
-                    <button id=target>Go</button>\
+                    <button id=target style='position:absolute;top:500px;left:10px'>Go</button>\
                     </body>",
                 "waitUntil": "load"
             }),

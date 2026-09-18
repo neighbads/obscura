@@ -15770,9 +15770,15 @@ if (typeof Document !== 'undefined' && !Document.prototype.elementFromPoint) {
       }
     }
     // The correct hit is whichever candidate is not an ancestor of any other
-    // candidate — i.e. the most-nested one actually under the point.
+    // candidate — i.e. the most-nested one actually under the point. That
+    // still leaves ties between candidates that aren't nested in each other
+    // at all (two unrelated, overlapping siblings, e.g. a positioned box
+    // drawn over a plain document flow div). querySelectorAll('*') walks in
+    // document order, which for unpositioned/unstyled siblings is also paint
+    // order — later elements paint on top of earlier ones — so break such
+    // ties toward the last qualifying candidate, not the first.
     var best = null;
-    for (var j = 0; j < candidates.length; j++) {
+    for (var j = candidates.length - 1; j >= 0; j--) {
       var c = candidates[j];
       var isAncestorOfOther = false;
       for (var k = 0; k < candidates.length; k++) {

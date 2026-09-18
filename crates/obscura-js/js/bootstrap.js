@@ -49,7 +49,7 @@ const __obscuraCore = globalThis.Deno.core;
     '_commonFonts', '_isXMLDocument', '_isValidPITarget', '_isHTMLEl',
     '_nodeList', '_rngNodeLength', '_rngNodeIndex', '_rngSame', '_rngRoot',
     '_rngAncestors', '_rngOrder', '_rngCmp', '_rngCheckOffset',
-    '_idbRequest', '_idbObjectStore', '_idbTransaction', '_idbDatabase',
+    '_idbBackingStores', '_idbGetBacking', '_idbStringList', '_idbSettle',
     '_makeListenerBox',
     // WebIDL interfaces. A real browser exposes these on the global as
     // enumerable:false; here they were assigned with `globalThis.X = X`, which
@@ -68,6 +68,8 @@ const __obscuraCore = globalThis.Deno.core;
     'HTMLAudioElement', 'WebGL2RenderingContext',
     'SVGElement', 'SVGGraphicsElement', 'SVGGeometryElement', 'SVGPathElement',
     'SVGSVGElement',
+    'IDBRequest', 'IDBOpenDBRequest', 'IDBTransaction', 'IDBDatabase',
+    'IDBObjectStore', 'IDBCursor', 'IDBIndex',
   ];
   var _desc = { value: undefined, writable: true, enumerable: false, configurable: true };
   for (var _i = 0; _i < _names.length; _i++) {
@@ -13706,120 +13708,355 @@ globalThis.RTCPeerConnection = class RTCPeerConnection {
 globalThis.RTCSessionDescription = class RTCSessionDescription { constructor(d){this.type=d?.type;this.sdp=d?.sdp;} };
 globalThis.RTCIceCandidate = class RTCIceCandidate { constructor(d){this.candidate=d?.candidate||'';} };
 
-// Minimal but spec-shape-correct IndexedDB shim. We don't persist anything,
-// but authentication libraries (Firebase, Supabase, dexie) hang forever on
-// the first `get` because their request's `onsuccess` is never called. Fire
-// `onsuccess` asynchronously with `null` so reads complete-but-empty, which
-// most libraries treat as a cache miss and fall back to the network.
-function _idbRequest(produceResult) {
-  const req = {
-    result: undefined,
-    error: null,
-    source: null,
-    transaction: null,
-    readyState: 'pending',
-    onsuccess: null,
-    onerror: null,
-    addEventListener(type, fn) { req['on' + type] = fn; },
-    removeEventListener(type, fn) { if (req['on' + type] === fn) req['on' + type] = null; },
+// Minimal but spec-shape-correct IndexedDB shim. Exposes real global
+// constructors (IDBRequest/IDBOpenDBRequest/IDBTransaction/IDBDatabase/
+// IDBObjectStore/IDBCursor/IDBIndex) because libraries that feature-detect
+// IndexedDB support by checking `typeof IDBTransaction` etc. (Dexie and
+// others) otherwise treat it as unsupported and never call `open()` at all.
+// Fires `onupgradeneeded` with real oldVersion/newVersion on the first
+// `open()` of a database (or any `open()` requesting a higher version) so
+// schema-creation code actually runs and object stores exist afterward.
+// Backing storage is keyed by database name and shared across every
+// `open()` call for that name -- previously each `open()` created a fresh,
+// disconnected in-memory store, so a write made through one connection was
+// invisible to a later connection opened against the same database name.
+const _idbBackingStores = new Map(); // name -> { version, stores: Map<storeName, Map>, storeMeta: Map<storeName, {keyPath, autoIncrement, indexes}> }
+
+function _idbGetBacking(name) {
+  let backing = _idbBackingStores.get(name);
+  if (!backing) {
+    backing = { version: 0, stores: new Map(), storeMeta: new Map() };
+    _idbBackingStores.set(name, backing);
+  }
+  return backing;
+}
+
+function _idbStringList(names) {
+  const arr = names.slice().sort();
+  return {
+    length: arr.length,
+    contains(n) { return arr.indexOf(n) !== -1; },
+    item(i) { return i >= 0 && i < arr.length ? arr[i] : null; },
   };
+}
+
+class IDBRequest {
+  constructor(source, transaction) {
+    this.result = undefined;
+    this.error = null;
+    this.source = source ?? null;
+    this.transaction = transaction ?? null;
+    this.readyState = 'pending';
+    this.onsuccess = null;
+    this.onerror = null;
+    this._listeners = Object.create(null);
+  }
+  addEventListener(type, fn) { (this._listeners[type] || (this._listeners[type] = [])).push(fn); }
+  removeEventListener(type, fn) {
+    const l = this._listeners[type];
+    if (!l) return;
+    const i = l.indexOf(fn);
+    if (i !== -1) l.splice(i, 1);
+  }
+  _fire(type, evt) {
+    evt = evt || { target: this, type };
+    const handler = this['on' + type];
+    if (typeof handler === 'function') { try { handler(evt); } catch (e) {} }
+    for (const fn of (this._listeners[type] || []).slice()) { try { fn(evt); } catch (e) {} }
+  }
+}
+
+class IDBOpenDBRequest extends IDBRequest {
+  constructor() {
+    super();
+    this.onupgradeneeded = null;
+    this.onblocked = null;
+  }
+}
+
+function _idbSettle(req, produceResult) {
   Promise.resolve().then(() => {
     try {
       req.result = produceResult();
       req.readyState = 'done';
-      if (typeof req.onsuccess === 'function') {
-        try { req.onsuccess({ target: req, type: 'success' }); } catch (e) {}
-      }
+      req._fire('success');
     } catch (e) {
-      req.error = e; req.readyState = 'done';
-      if (typeof req.onerror === 'function') {
-        try { req.onerror({ target: req, type: 'error' }); } catch (e2) {}
-      }
+      req.error = e;
+      req.readyState = 'done';
+      req._fire('error');
     }
   });
   return req;
 }
 
-function _idbObjectStore(name) {
-  const data = new Map();
-  return {
-    name,
-    keyPath: null,
-    autoIncrement: false,
-    indexNames: { contains() { return false; }, length: 0, item() { return null; } },
-    transaction: null,
-    add(value, key) { const k = key ?? Date.now(); data.set(k, value); return _idbRequest(() => k); },
-    put(value, key) { const k = key ?? Date.now(); data.set(k, value); return _idbRequest(() => k); },
-    get(key) { return _idbRequest(() => data.get(key) ?? undefined); },
-    getAll() { return _idbRequest(() => Array.from(data.values())); },
-    getAllKeys() { return _idbRequest(() => Array.from(data.keys())); },
-    getKey(key) { return _idbRequest(() => (data.has(key) ? key : undefined)); },
-    delete(key) { return _idbRequest(() => { data.delete(key); return undefined; }); },
-    clear() { return _idbRequest(() => { data.clear(); return undefined; }); },
-    count() { return _idbRequest(() => data.size); },
-    openCursor() { return _idbRequest(() => null); },
-    openKeyCursor() { return _idbRequest(() => null); },
-    createIndex() { return { name: '', keyPath: '', unique: false, multiEntry: false, get() { return _idbRequest(() => undefined); } }; },
-    index() { return { get() { return _idbRequest(() => undefined); }, getAll() { return _idbRequest(() => []); }, count() { return _idbRequest(() => 0); }, openCursor() { return _idbRequest(() => null); } }; },
-    deleteIndex() {},
-  };
-}
-
-function _idbTransaction(storeNames) {
-  const stores = new Map();
-  const names = Array.isArray(storeNames) ? storeNames : [storeNames];
-  for (const n of names) stores.set(String(n), _idbObjectStore(String(n)));
-  const tx = {
-    db: null,
-    mode: 'readonly',
-    objectStoreNames: { contains: (n) => stores.has(String(n)), length: stores.size },
-    onabort: null, oncomplete: null, onerror: null,
-    error: null,
-    objectStore(name) {
-      let s = stores.get(name);
-      if (!s) { s = _idbObjectStore(name); stores.set(name, s); }
-      s.transaction = tx;
-      return s;
-    },
-    abort() {},
-    commit() {},
-    addEventListener(type, fn) { tx['on' + type] = fn; },
-    removeEventListener(type, fn) { if (tx['on' + type] === fn) tx['on' + type] = null; },
-  };
-  Promise.resolve().then(() => {
-    if (typeof tx.oncomplete === 'function') {
-      try { tx.oncomplete({ target: tx, type: 'complete' }); } catch (e) {}
+class IDBCursor {
+  constructor(objectStore, primaryKeys) {
+    this.source = objectStore;
+    this.direction = 'next';
+    this._keys = primaryKeys;
+    this._pos = -1;
+    this.key = undefined;
+    this.primaryKey = undefined;
+    this.value = undefined;
+    this._advance();
+  }
+  _advance() {
+    this._pos++;
+    if (this._pos < this._keys.length) {
+      this.primaryKey = this._keys[this._pos];
+      this.key = this.primaryKey;
+      this.value = this.source._data.get(this.primaryKey);
+    } else {
+      this.primaryKey = undefined; this.key = undefined; this.value = undefined;
     }
-  });
-  return tx;
+  }
+  continue() { this._advance(); }
+  advance(count) { for (let i = 0; i < (count || 1); i++) this._advance(); }
+  update(value) {
+    if (this.primaryKey === undefined) throw new DOMException('No current cursor value', 'InvalidStateError');
+    this.source._data.set(this.primaryKey, value);
+    return _idbSettle(new IDBRequest(this.source), () => undefined);
+  }
+  delete() {
+    if (this.primaryKey === undefined) throw new DOMException('No current cursor value', 'InvalidStateError');
+    this.source._data.delete(this.primaryKey);
+    return _idbSettle(new IDBRequest(this.source), () => undefined);
+  }
 }
 
-function _idbDatabase(name, version) {
-  return {
-    name,
-    version,
-    objectStoreNames: { contains() { return false; }, length: 0, item() { return null; } },
-    createObjectStore(n) { return _idbObjectStore(n); },
-    deleteObjectStore() {},
-    transaction(storeNames, mode) {
-      const tx = _idbTransaction(storeNames);
-      tx.mode = mode || 'readonly';
-      return tx;
-    },
-    close() {},
-    onversionchange: null, onabort: null, onerror: null, onclose: null,
-    addEventListener() {}, removeEventListener() {},
-  };
+class IDBIndex {
+  constructor(name, objectStore, keyPath, options) {
+    this.name = name;
+    this.objectStore = objectStore;
+    this.keyPath = keyPath;
+    this.unique = !!(options && options.unique);
+    this.multiEntry = !!(options && options.multiEntry);
+  }
+  _entries() {
+    const out = [];
+    for (const [pk, v] of this.objectStore._data) {
+      const k = v && typeof v === 'object' ? v[this.keyPath] : undefined;
+      if (k !== undefined) out.push([k, pk, v]);
+    }
+    return out;
+  }
+  get(key) {
+    const e = this._entries().find((x) => x[0] === key);
+    return _idbSettle(new IDBRequest(this), () => (e ? e[2] : undefined));
+  }
+  getKey(key) {
+    const e = this._entries().find((x) => x[0] === key);
+    return _idbSettle(new IDBRequest(this), () => (e ? e[1] : undefined));
+  }
+  getAll() { return _idbSettle(new IDBRequest(this), () => this._entries().map((x) => x[2])); }
+  getAllKeys() { return _idbSettle(new IDBRequest(this), () => this._entries().map((x) => x[1])); }
+  count() { return _idbSettle(new IDBRequest(this), () => this._entries().length); }
+  openCursor() {
+    return _idbSettle(new IDBRequest(this), () => {
+      const pks = this._entries().map((x) => x[1]);
+      return pks.length ? new IDBCursor(this.objectStore, pks) : null;
+    });
+  }
+}
+
+class IDBObjectStore {
+  constructor(name, backing, transaction) {
+    this.name = name;
+    this._backing = backing;
+    this.transaction = transaction ?? null;
+    const meta = backing.storeMeta.get(name) || { keyPath: null, autoIncrement: false };
+    this.keyPath = meta.keyPath;
+    this.autoIncrement = meta.autoIncrement;
+    this._nextKey = 1;
+  }
+  get _data() { return this._backing.stores.get(this.name); }
+  get indexNames() {
+    const meta = this._backing.storeMeta.get(this.name);
+    return _idbStringList(meta ? Array.from(meta.indexes.keys()) : []);
+  }
+  _keyFor(value, key) {
+    if (key !== undefined) return key;
+    if (this.keyPath) {
+      const k = value && typeof value === 'object' ? value[this.keyPath] : undefined;
+      if (k !== undefined) return k;
+    }
+    if (this.autoIncrement) return this._nextKey++;
+    throw new DOMException("No key or keyPath given for IDBObjectStore operation", 'DataError');
+  }
+  add(value, key) {
+    const k = this._keyFor(value, key);
+    const data = this._data;
+    return _idbSettle(new IDBRequest(this, this.transaction), () => {
+      if (data.has(k)) throw new DOMException('Key already exists in the object store', 'ConstraintError');
+      data.set(k, value);
+      return k;
+    });
+  }
+  put(value, key) {
+    const k = this._keyFor(value, key);
+    const data = this._data;
+    return _idbSettle(new IDBRequest(this, this.transaction), () => { data.set(k, value); return k; });
+  }
+  get(key) { const data = this._data; return _idbSettle(new IDBRequest(this, this.transaction), () => data.get(key)); }
+  getAll() { const data = this._data; return _idbSettle(new IDBRequest(this, this.transaction), () => Array.from(data.values())); }
+  getAllKeys() { const data = this._data; return _idbSettle(new IDBRequest(this, this.transaction), () => Array.from(data.keys())); }
+  getKey(key) { const data = this._data; return _idbSettle(new IDBRequest(this, this.transaction), () => (data.has(key) ? key : undefined)); }
+  delete(key) { const data = this._data; return _idbSettle(new IDBRequest(this, this.transaction), () => { data.delete(key); return undefined; }); }
+  clear() { const data = this._data; return _idbSettle(new IDBRequest(this, this.transaction), () => { data.clear(); return undefined; }); }
+  count() { const data = this._data; return _idbSettle(new IDBRequest(this, this.transaction), () => data.size); }
+  openCursor() {
+    const data = this._data;
+    return _idbSettle(new IDBRequest(this, this.transaction), () => {
+      const pks = Array.from(data.keys());
+      return pks.length ? new IDBCursor(this, pks) : null;
+    });
+  }
+  openKeyCursor() { return this.openCursor(); }
+  createIndex(name, keyPath, options) {
+    const meta = this._backing.storeMeta.get(this.name);
+    meta.indexes.set(name, { keyPath, options });
+    return new IDBIndex(name, this, keyPath, options);
+  }
+  index(name) {
+    const meta = this._backing.storeMeta.get(this.name);
+    const def = meta && meta.indexes.get(name);
+    if (!def) throw new DOMException(`Index '${name}' does not exist`, 'NotFoundError');
+    return new IDBIndex(name, this, def.keyPath, def.options);
+  }
+  deleteIndex(name) {
+    const meta = this._backing.storeMeta.get(this.name);
+    if (meta) meta.indexes.delete(name);
+  }
+}
+
+class IDBTransaction {
+  constructor(storeNames, mode, backing, db) {
+    this.db = db;
+    this.mode = mode || 'readonly';
+    this.error = null;
+    this.onabort = null; this.oncomplete = null; this.onerror = null;
+    this._listeners = Object.create(null);
+    this._backing = backing;
+    this._storeNames = storeNames.slice();
+    // Real transactions complete asynchronously once their operations
+    // settle; we don't track individual request completion, so fire
+    // `oncomplete` on the next microtask -- late enough that requests
+    // issued synchronously against this transaction have already been
+    // scheduled, early enough that callers awaiting the transaction still
+    // observe it finishing.
+    Promise.resolve().then(() => this._fire('complete'));
+  }
+  get objectStoreNames() { return _idbStringList(this._storeNames); }
+  objectStore(name) {
+    if (!this._backing.stores.has(name)) {
+      throw new DOMException(`Object store '${name}' not found`, 'NotFoundError');
+    }
+    return new IDBObjectStore(name, this._backing, this);
+  }
+  abort() { this._fire('abort'); }
+  commit() {}
+  addEventListener(type, fn) { (this._listeners[type] || (this._listeners[type] = [])).push(fn); }
+  removeEventListener(type, fn) {
+    const l = this._listeners[type];
+    if (!l) return;
+    const i = l.indexOf(fn);
+    if (i !== -1) l.splice(i, 1);
+  }
+  _fire(type, evt) {
+    evt = evt || { target: this, type };
+    const handler = this['on' + type];
+    if (typeof handler === 'function') { try { handler(evt); } catch (e) {} }
+    for (const fn of (this._listeners[type] || []).slice()) { try { fn(evt); } catch (e) {} }
+  }
+}
+
+class IDBDatabase {
+  constructor(name, backing) {
+    this.name = name;
+    this._backing = backing;
+    this.onversionchange = null; this.onabort = null; this.onerror = null; this.onclose = null;
+    this._listeners = Object.create(null);
+  }
+  get version() { return this._backing.version; }
+  get objectStoreNames() { return _idbStringList(Array.from(this._backing.stores.keys())); }
+  createObjectStore(name, options) {
+    this._backing.stores.set(name, new Map());
+    this._backing.storeMeta.set(name, {
+      keyPath: (options && options.keyPath) ?? null,
+      autoIncrement: !!(options && options.autoIncrement),
+      indexes: new Map(),
+    });
+    return new IDBObjectStore(name, this._backing, null);
+  }
+  deleteObjectStore(name) {
+    this._backing.stores.delete(name);
+    this._backing.storeMeta.delete(name);
+  }
+  transaction(storeNames, mode) {
+    const names = Array.isArray(storeNames) ? storeNames : [storeNames];
+    return new IDBTransaction(names, mode || 'readonly', this._backing, this);
+  }
+  close() {}
+  addEventListener(type, fn) { (this._listeners[type] || (this._listeners[type] = [])).push(fn); }
+  removeEventListener(type, fn) {
+    const l = this._listeners[type];
+    if (!l) return;
+    const i = l.indexOf(fn);
+    if (i !== -1) l.splice(i, 1);
+  }
 }
 
 globalThis.indexedDB = {
   open(name, version) {
-    return _idbRequest(() => _idbDatabase(name, version || 1));
+    const req = new IDBOpenDBRequest();
+    Promise.resolve().then(() => {
+      try {
+        const backing = _idbGetBacking(name);
+        const oldVersion = backing.version;
+        const newVersion = version != null ? version : Math.max(1, oldVersion);
+        const db = new IDBDatabase(name, backing);
+        if (newVersion > oldVersion) {
+          backing.version = newVersion;
+          req.result = db;
+          req.transaction = db.transaction(Array.from(backing.stores.keys()), 'versionchange');
+          req._fire('upgradeneeded', { target: req, type: 'upgradeneeded', oldVersion, newVersion });
+          req.transaction = null;
+        }
+        req.result = db;
+        req.readyState = 'done';
+        req._fire('success');
+      } catch (e) {
+        req.error = e;
+        req.readyState = 'done';
+        req._fire('error');
+      }
+    });
+    return req;
   },
-  deleteDatabase(_name) { return _idbRequest(() => undefined); },
-  databases() { return Promise.resolve([]); },
+  deleteDatabase(name) {
+    const req = new IDBOpenDBRequest();
+    Promise.resolve().then(() => {
+      _idbBackingStores.delete(name);
+      req.result = undefined;
+      req.readyState = 'done';
+      req._fire('success');
+    });
+    return req;
+  },
+  databases() {
+    return Promise.resolve(Array.from(_idbBackingStores.entries()).map(([name, b]) => ({ name, version: b.version })));
+  },
   cmp(a, b) { return a < b ? -1 : a > b ? 1 : 0; },
 };
+globalThis.IDBRequest = IDBRequest;
+globalThis.IDBOpenDBRequest = IDBOpenDBRequest;
+globalThis.IDBTransaction = IDBTransaction;
+globalThis.IDBDatabase = IDBDatabase;
+globalThis.IDBObjectStore = IDBObjectStore;
+globalThis.IDBCursor = IDBCursor;
+globalThis.IDBIndex = IDBIndex;
+_markNative(IDBRequest); _markNative(IDBOpenDBRequest); _markNative(IDBTransaction);
+_markNative(IDBDatabase); _markNative(IDBObjectStore); _markNative(IDBCursor); _markNative(IDBIndex);
 globalThis.IDBKeyRange = {
   only(v) { return { lower: v, upper: v, lowerOpen: false, upperOpen: false, includes(x) { return x === v; } }; },
   lowerBound(v, open) { return { lower: v, upper: null, lowerOpen: !!open, upperOpen: false, includes(x) { return open ? x > v : x >= v; } }; },

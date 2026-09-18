@@ -19052,6 +19052,73 @@ mod tests {
         );
     }
 
+    // The IndexedDB shim previously exposed no IDBTransaction/IDBDatabase/
+    // IDBObjectStore/etc. globals (libraries that feature-detect IndexedDB
+    // support via `typeof IDBTransaction` treat it as unsupported and never
+    // call `open()`), never fired `onupgradeneeded` (schema-creation code
+    // never ran), and gave every `open()` call a fresh, disconnected
+    // in-memory store (a write made through one connection was invisible to
+    // a later connection opened against the same database name).
+    #[tokio::test(flavor = "current_thread")]
+    async fn indexed_db_fires_upgradeneeded_and_shares_storage_by_database_name() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let globals = rt
+            .evaluate(
+                "[typeof indexedDB, typeof IDBTransaction, typeof IDBOpenDBRequest, \
+                 typeof IDBDatabase, typeof IDBObjectStore, typeof IDBRequest, \
+                 typeof IDBCursor, typeof IDBIndex].join(',')",
+            )
+            .unwrap();
+        assert_eq!(
+            globals,
+            serde_json::json!(
+                "object,function,function,function,function,function,function,function"
+            ),
+            "real global IDB* constructors must exist for feature-detection"
+        );
+
+        rt.evaluate(
+            r#"(() => {
+                globalThis.__events = [];
+                const req1 = indexedDB.open('mydb', 2);
+                req1.onupgradeneeded = (e) => {
+                    globalThis.__events.push('upgradeneeded:' + e.oldVersion + '->' + e.newVersion);
+                    req1.result.createObjectStore('kv');
+                };
+                req1.onsuccess = () => {
+                    globalThis.__events.push('open1-success');
+                    const tx = req1.result.transaction('kv', 'readwrite');
+                    tx.objectStore('kv').put('bar', 'foo');
+                    tx.oncomplete = () => {
+                        globalThis.__events.push('tx1-complete');
+                        const req2 = indexedDB.open('mydb', 2);
+                        req2.onsuccess = () => {
+                            globalThis.__events.push('open2-success');
+                            const getReq = req2.result.transaction('kv', 'readonly').objectStore('kv').get('foo');
+                            getReq.onsuccess = () => {
+                                globalThis.__events.push('get:' + getReq.result);
+                            };
+                        };
+                    };
+                };
+            })()"#,
+        )
+        .unwrap();
+
+        rt.run_event_loop_bounded(200).await.unwrap();
+
+        let events = rt.evaluate("globalThis.__events.join('|')").unwrap();
+        assert_eq!(
+            events,
+            serde_json::json!(
+                "upgradeneeded:0->2|open1-success|tx1-complete|open2-success|get:bar"
+            ),
+            "onupgradeneeded must fire with real oldVersion/newVersion, and a \
+             second open() of the same database name must see the store and \
+             data created through the first connection"
+        );
+    }
+
     fn spawn_one_response_server(status: &str, body: &str) -> String {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();

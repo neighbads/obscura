@@ -11986,10 +11986,31 @@ fn defer_cyclic_flex_inline_sizes(
             continue;
         };
         if let Some(style) = styles.get_mut(&id) {
-            let intrinsic = crate::Dimension::Px(intrinsic.max(0.0));
+            let intrinsic_px = crate::Dimension::Px(intrinsic.max(0.0));
             match slot {
-                0 => style.width = intrinsic,
-                2 => style.min_width = intrinsic,
+                // A cyclic percentage width on a non-replaced box behaves as
+                // auto during intrinsic contribution sizing, the same as the
+                // max-size case below: pinning a flex/block container's own
+                // width to zero here discards its subtree's real
+                // content-based minimum (button text, input placeholders,
+                // ...) instead of just leaving the percentage unresolved,
+                // collapsing whatever shrink-to-fit ancestor contains it. A
+                // replaced element (img/video/...) has its own natural size
+                // as the intrinsic contribution instead, which is already
+                // handled by the `natural_floor` lookup below once the
+                // ancestor flex item is pinned, so it keeps the zero
+                // placeholder here rather than measuring at its full natural
+                // size before that ancestor's used width is known.
+                0 => {
+                    style.width = if matches!(source, DeferredCyclicInlineSource::Percent(_))
+                        && !style.has_replaced_sizing
+                    {
+                        crate::Dimension::Auto
+                    } else {
+                        intrinsic_px
+                    }
+                }
+                2 => style.min_width = intrinsic_px,
                 // A cyclic percentage max-size behaves as its initial value
                 // during intrinsic contribution sizing; treating 50% as a
                 // zero maximum would erase real text/content minimums.
@@ -18823,6 +18844,57 @@ mod tests {
             (rect("art").width - 100.0).abs() < 0.01 && (rect("art").height - 50.0).abs() < 0.01,
             "the percentage image must resolve against the measured item width: {:?}",
             rect("art")
+        );
+    }
+
+    #[test]
+    fn cyclic_percentage_width_chain_keeps_ancestor_shrink_to_fit_content(
+    ) {
+        // github.com's CTA form is `display:block` (shrink-to-fit, auto
+        // width) as a row-flex item, and its own inner markup switches
+        // direction: a `flex-direction:column` wrapper around a
+        // `flex-direction:row` wrapper, both declared `width:100%`. Neither
+        // percentage can resolve against the auto-width form during
+        // intrinsic sizing (its own width is exactly what is being
+        // measured), so `defer_cyclic_flex_inline_sizes` neutralizes them.
+        // Neutralizing to a definite `Px(0)` placeholder (instead of `auto`)
+        // made every nested `width:100%` box a hard zero-width box during
+        // that pass, discarding the real button/input content underneath
+        // and pinning the form's own shrink-to-fit width to 0 for the rest
+        // of layout (R-05: the CTA button then overlapped the adjacent
+        // "Download GitHub Copilot app" link by ~129px on the real page).
+        let tree = parse_html(
+            r#"<style>
+               html, body { margin:0 }
+               .cta { display:flex; flex-direction:row; flex-wrap:wrap; width:446px; gap:16px }
+               #box { display:block }
+               .col { display:flex; flex-direction:column; width:100% }
+               .inner { display:flex; flex-direction:row }
+               .content { display:block; width:180px; height:20px }
+               #sibling { flex-shrink:0; width:200px; height:20px }
+               </style>
+               <div class="cta">
+                 <div id="box"><div class="col"><div class="inner"><div id="content" class="content"></div></div></div></div>
+                 <div id="sibling"></div>
+               </div>"#,
+        );
+        let laid = layout_dom(&tree, (1280.0, 720.0));
+        let node = |id: &str| tree.get_element_by_id(id).unwrap();
+        let rect = |id: &str| -> Rect { laid.rects[&node(id)] };
+        let (box_rect, content_rect, sibling_rect) =
+            (rect("box"), rect("content"), rect("sibling"));
+
+        assert!(
+            (box_rect.width - 180.0).abs() < 0.01,
+            "the shrink-to-fit ancestor must size to its real content width, not collapse to 0: {box_rect:?}"
+        );
+        assert!(
+            content_rect.x + content_rect.width <= box_rect.x + box_rect.width + 0.01,
+            "the content must stay inside its collapsed-looking ancestor: content={content_rect:?} box={box_rect:?}"
+        );
+        assert!(
+            sibling_rect.x + 0.01 >= box_rect.x + box_rect.width,
+            "the CTA sibling must not overlap the shrink-to-fit box: sibling={sibling_rect:?} box={box_rect:?}"
         );
     }
 

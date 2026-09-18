@@ -40,9 +40,24 @@ CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --release -p obscura-cli --bi
 Run tests with **`cargo nextest`, not `cargo test`**:
 
 ```bash
-cargo nextest run --release --features render -p <crate>
 cargo nextest run --release --features render --no-fail-fast
+cargo nextest run --release --features render -p <crate>
 ```
+
+`--features render` only resolves against the workspace root or a crate that
+defines it: `obscura`, `obscura-cli`, `obscura-browser`, `obscura-js`,
+`obscura-cdp`, `obscura-mcp`. Passing it together with `-p <crate>` for any
+other crate fails with *"the package does not contain this feature"*. Most
+notably `obscura-render` defines only `paint`:
+
+```bash
+cargo nextest run --release --features paint -p obscura-render --no-fail-fast
+cargo nextest run -p obscura-js
+cargo nextest run -p obscura-dom
+```
+
+Check the crate's own `Cargo.toml` `[features]` before passing `--features` with
+`-p`.
 
 `cargo test` runs the whole test binary in one process, but the engine holds a
 single V8 isolate per process, so the runtime tests fail under it. `nextest`

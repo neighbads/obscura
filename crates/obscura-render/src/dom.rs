@@ -5016,7 +5016,7 @@ fn layout_dom_once(
                 // CSS-wide inheritance markers a second time. Seed the
                 // inherited context for a fresh descendant directly from the
                 // prior computed values, then retain the style byte-for-byte.
-                if let Some(style) = styles.get(&id) {
+                if let Some(style) = styles.get_mut(&id) {
                     crate::style::set_grid_calc_context(
                         style,
                         style.font_size.or(inh.font_size).unwrap_or(16.0),
@@ -5117,6 +5117,22 @@ fn layout_dom_once(
                     } else {
                         0
                     };
+                    // A retained style's `height` was already normalized once,
+                    // but that normalization baked in the containing block's
+                    // definiteness *at that time*. A reused node's inherited
+                    // context is still recomputed fresh on every pass (see
+                    // `inh` above), so an ancestor that flips from a definite
+                    // to an indefinite height between passes must still
+                    // downgrade this node's retained `height:100%`-style
+                    // Percent to Auto, exactly like the fresh path below does,
+                    // or Taffy resolves the stale percentage against an
+                    // indefinite containing block and collapses it to zero.
+                    if matches!(style.height, crate::Dimension::Percent(_))
+                        && !inh.cb_height_definite
+                        && !matches!(style.position, Some(taffy::Position::Absolute))
+                    {
+                        style.height = crate::Dimension::Auto;
+                    }
                     child_cb_height_definite = matches!(
                         style.height,
                         crate::Dimension::Px(_) | crate::Dimension::Percent(_)
@@ -16955,6 +16971,89 @@ mod tests {
         );
         let child = tree.get_element_by_id("child").unwrap();
         assert_eq!(incremental.styles[&child].color, Some([128, 0, 128, 255]));
+    }
+
+    /// R-01 (Bing search box measures height:0): a reused (non-fresh) node's
+    /// retained `height:100%` must still be downgraded to `Auto` if its
+    /// current-pass containing block turns out indefinite, exactly like the
+    /// fresh style-resolution path does a few lines below in
+    /// `layout_dom_once`. Drives `layout_dom_once` directly with a
+    /// hand-built `fresh` set (bypassing `retained_style_plan`) so the
+    /// scenario is deterministic: only `#outer` loses its explicit height
+    /// between passes, `#target` (the `height:100%` descendant) is never
+    /// marked fresh and must be re-evaluated against the new, indefinite
+    /// containing block on every pass, not frozen at whatever containing
+    /// block happened to be in force when its style was first cached.
+    #[test]
+    fn reused_retained_style_redowngrades_stale_percent_height_to_auto() {
+        let html = r#"<!doctype html><div id=outer style="height:60px">
+            <div id=target style="height:100%">hello world</div>
+        </div>"#;
+        let tree = parse_html(html);
+        let outer = tree.get_element_by_id("outer").unwrap();
+        let target = tree.get_element_by_id("target").unwrap();
+        let viewport = (300.0, 200.0);
+        let sheet = crate::css::Stylesheet::parse_for_viewport(&tree, &[], viewport);
+        let mut timeline = crate::AnimationTimelineState::default();
+
+        let (initial, ..) = layout_dom_once(
+            &tree,
+            viewport,
+            &HashMap::new(),
+            &[],
+            &sheet,
+            &HashMap::new(),
+            None,
+            None,
+            crate::AnimationSample::document(0.0),
+            &mut timeline,
+        );
+        // Sanity check on the premise: under the definite 60px ancestor, the
+        // percent height must have survived uncollapsed for taffy to resolve.
+        assert_eq!(
+            initial.styles[&target].height,
+            crate::Dimension::Percent(1.0)
+        );
+        assert!(initial.rects[&target].height > 0.0);
+
+        // Drop #outer's explicit height so its containing block becomes
+        // indefinite, but hand-build a `fresh` set containing only #outer.
+        // #target's own declaration (`height:100%`) never changed, so a
+        // precise invalidator would leave it retained exactly like this.
+        tree.with_node_mut(outer, |node| node.set_attribute("style", String::new()));
+        let retained = RetainedStyleMaps {
+            styles: initial.styles.clone(),
+            custom_properties: initial.custom_properties.clone(),
+        };
+        let fresh = HashSet::from([outer]);
+        let (incremental, ..) = layout_dom_once(
+            &tree,
+            viewport,
+            &HashMap::new(),
+            &[],
+            &sheet,
+            &HashMap::new(),
+            None,
+            Some((retained, fresh)),
+            crate::AnimationSample::document(0.0),
+            &mut timeline,
+        );
+
+        let full_tree = parse_html(
+            r#"<!doctype html><div id=outer>
+            <div id=target style="height:100%">hello world</div>
+        </div>"#,
+        );
+        let full = layout_dom(&full_tree, viewport);
+        let full_target = full_tree.get_element_by_id("target").unwrap();
+
+        assert_eq!(incremental.styles[&target].height, crate::Dimension::Auto);
+        assert!(
+            (incremental.rects[&target].height - full.rects[&full_target].height).abs() < 0.1,
+            "reused #target must resize to content like a full recompute: {:?} vs {:?}",
+            incremental.rects[&target],
+            full.rects[&full_target]
+        );
     }
 
     #[test]

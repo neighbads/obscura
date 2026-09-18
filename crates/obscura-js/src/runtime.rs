@@ -15411,6 +15411,66 @@ mod tests {
         assert_eq!(head_is_iframe, serde_json::json!(false));
     }
 
+    /// Systemic version of the regression above: ~30 other HTMLXxxElement
+    /// interfaces had the exact same defect (aliased straight to the generic
+    /// `Element` class), so `instanceof` against any of them was true for
+    /// every element on the page instead of just the matching tag. Frontend
+    /// libraries commonly branch on `instanceof HTMLXxxElement` for feature
+    /// detection and polymorphic dispatch, so this silently misrouted logic
+    /// site-wide without ever throwing. Covers positive matches, negative
+    /// cross-tag matches, and the HTMLElement/Element/Node/EventTarget
+    /// inheritance chain, which must stay true for every HTML element.
+    #[test]
+    fn html_element_instanceof_is_tag_specific() {
+        let mut rt = setup_runtime(
+            r#"<div id="d"></div><input id="i"><button id="b"></button>
+               <ul id="ul"></ul><ol id="ol"></ol>
+               <table><tr id="tr"><td id="td"></td><th id="th"></th></tr></table>
+               <h2 id="h"></h2>"#,
+        );
+
+        // Positive cases: each element is an instance of its own interface.
+        for (id, ctor) in [
+            ("d", "HTMLDivElement"),
+            ("i", "HTMLInputElement"),
+            ("b", "HTMLButtonElement"),
+            ("ul", "HTMLUListElement"),
+            ("ol", "HTMLOListElement"),
+            ("tr", "HTMLTableRowElement"),
+            ("td", "HTMLTableCellElement"),
+            ("th", "HTMLTableCellElement"),
+            ("h", "HTMLHeadingElement"),
+        ] {
+            let expr = format!("document.getElementById('{id}') instanceof {ctor}");
+            let result = rt.evaluate(&expr).unwrap();
+            assert_eq!(result, serde_json::json!(true), "expected true for: {expr}");
+        }
+
+        // Negative cases: an element must not satisfy an unrelated interface
+        // (the exact regression: before the fix, every one of these was true).
+        for (id, ctor) in [
+            ("d", "HTMLInputElement"),
+            ("i", "HTMLButtonElement"),
+            ("ul", "HTMLOListElement"),
+            ("ol", "HTMLUListElement"),
+            ("d", "HTMLTableCellElement"),
+            ("b", "HTMLDivElement"),
+        ] {
+            let expr = format!("document.getElementById('{id}') instanceof {ctor}");
+            let result = rt.evaluate(&expr).unwrap();
+            assert_eq!(result, serde_json::json!(false), "expected false for: {expr}");
+        }
+
+        // Inheritance chain: a plain <div> is still every one of its real
+        // ancestors, including the common HTMLElement base (unlike
+        // HTMLDivElement, true for any HTML element).
+        for chain in ["HTMLElement", "Element", "Node", "EventTarget"] {
+            let expr = format!("document.getElementById('d') instanceof {chain}");
+            let result = rt.evaluate(&expr).unwrap();
+            assert_eq!(result, serde_json::json!(true), "expected true for: {expr}");
+        }
+    }
+
     /// Regression for #105: `Element.prepend` must actually insert at the
     /// start, not silently no-op.
     #[test]

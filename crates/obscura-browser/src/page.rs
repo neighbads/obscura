@@ -307,6 +307,11 @@ pub struct Page {
     callbacks: Arc<CallbackRegistry>,
     #[cfg(feature = "stealth")]
     pub stealth_client: Option<Arc<StealthHttpClient>>,
+    /// Wall-clock time of the last DOM walk for render resource candidates
+    /// done by the autonomous pump (see `rescan_render_resources_if_due`).
+    /// `None` means no autonomous rescan has run yet for this page.
+    #[cfg(feature = "render")]
+    render_resource_last_scan: Option<std::time::Instant>,
 }
 
 const MAX_STYLESHEET_IMPORT_DEPTH: u8 = 4;
@@ -1107,6 +1112,8 @@ impl Page {
             callbacks: Arc::new(CallbackRegistry::new()),
             #[cfg(feature = "stealth")]
             stealth_client,
+            #[cfg(feature = "render")]
+            render_resource_last_scan: None,
         }
     }
 
@@ -3123,6 +3130,10 @@ impl Page {
                 tokio::pin!(notified);
                 notified.as_mut().enable();
                 self.queue_pending_render_resources();
+                // The page is about to go idle and the pump about to disarm:
+                // this is the last chance before the next protocol command to
+                // notice anything a script inserted since the last rescan.
+                self.rescan_render_resources_if_due();
                 if self.has_pending_render_resources() {
                     notified.await;
                     self.drain_render_resource_results();
@@ -3133,6 +3144,7 @@ impl Page {
             // Geometry this turn produced may have missed resources; start
             // their loads now.
             self.queue_pending_render_resources();
+            self.rescan_render_resources_if_due();
             return Ok(reached_idle && !frame_work);
         }
         #[cfg(not(feature = "render"))]
@@ -3836,6 +3848,39 @@ impl Page {
         self.js
             .as_ref()
             .is_some_and(|js| js.has_pending_render_resources())
+    }
+
+    /// Re-walk the light DOM for render resource candidates if the rescan
+    /// interval has elapsed since the last walk. The two navigation warmups
+    /// (`prepare_screenshot_resources`) only snapshot the DOM once each, at
+    /// entry; nothing re-invokes `render_resource_candidates()` for the rest
+    /// of a live CDP session, so a resource a script inserts afterward (e.g.
+    /// from a `fetch().then()` callback) is never discovered until some
+    /// unrelated layout/paint happens to ask for it. `run_autonomous_event_loop_turn`
+    /// calls this after each JS turn and frame advance (never before one, so a
+    /// mutation the turn itself just made is never missed by an earlier call
+    /// spending the rate-limit budget on a stale DOM) so discovery keeps going
+    /// for the life of the session. A full DOM walk on every wake would cost
+    /// O(DOM size) on every timer/animation tick of a busy page, so this is
+    /// rate-limited by wall clock (`OBSCURA_RENDER_RESOURCE_RESCAN_MS`,
+    /// default 250ms) instead of running unconditionally.
+    #[cfg(feature = "render")]
+    fn rescan_render_resources_if_due(&mut self) {
+        let interval_ms = std::env::var("OBSCURA_RENDER_RESOURCE_RESCAN_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(250);
+        if interval_ms == 0 {
+            return;
+        }
+        let now = std::time::Instant::now();
+        if let Some(last) = self.render_resource_last_scan {
+            if now.duration_since(last) < std::time::Duration::from_millis(interval_ms) {
+                return;
+            }
+        }
+        self.render_resource_last_scan = Some(now);
+        self.spawn_pending_render_resources();
     }
 
     /// Seed the renderer cache through the owning page transport and wait up
@@ -7794,6 +7839,156 @@ mod tests {
         assert!(
             seen_rx.try_recv().is_err(),
             "neither layout nor capture may open a second request"
+        );
+    }
+
+    /// Serves an HTML document at `/page` whose inline script appends an
+    /// `<img src="/late.svg">` to the body `insert_delay_ms` after the
+    /// document is parsed, plus the SVG itself at `/late.svg`. Mirrors the
+    /// R-12 repro: a resource that only exists in the DOM after the entry
+    /// navigation warmups have already taken their one-shot snapshot.
+    #[cfg(feature = "render")]
+    fn spawn_delayed_dom_insert_server(insert_delay_ms: u64) -> std::net::SocketAddr {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while std::time::Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        std::thread::spawn(move || {
+                            let mut request = [0u8; 2048];
+                            let read = stream.read(&mut request).unwrap_or(0);
+                            let first_line = String::from_utf8_lossy(&request[..read])
+                                .lines()
+                                .next()
+                                .unwrap_or_default()
+                                .to_string();
+                            let (content_type, body): (&str, Vec<u8>) =
+                                if first_line.starts_with("GET /late.svg") {
+                                    (
+                                        "image/svg+xml",
+                                        br##"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="80"><rect width="100" height="80" fill="#ff0000"/></svg>"##.to_vec(),
+                                    )
+                                } else {
+                                    (
+                                        "text/html",
+                                        format!(
+                                            "<html><body style='margin:0'><script>\
+                                             setTimeout(function() {{\
+                                             var s = document.createElement('style');\
+                                             s.textContent = 'body {{ background-image: url(/late.svg); background-repeat: no-repeat; }}';\
+                                             document.head.appendChild(s);\
+                                             }}, {insert_delay_ms});\
+                                             </script></body></html>"
+                                        )
+                                        .into_bytes(),
+                                    )
+                                };
+                            let response = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                body.len()
+                            );
+                            let _ = stream.write_all(response.as_bytes());
+                            let _ = stream.write_all(&body);
+                        });
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        address
+    }
+
+    #[cfg(feature = "render")]
+    fn decode_screenshot_pixel(png: &[u8], x: u32, y: u32) -> [u8; 4] {
+        image::load_from_memory(png)
+            .expect("decodable screenshot")
+            .to_rgba8()
+            .get_pixel(x, y)
+            .0
+    }
+
+    /// R-12 deterministic repro. A script inserts a `<style>` rule with a
+    /// `background-image` into a live document after the two one-shot
+    /// navigation warmups (`OBSCURA_RENDER_RESOURCE_WARMUP_MS` /
+    /// `_POST_SCRIPT_WARMUP_MS`) have already taken their snapshot.
+    ///
+    /// This deliberately uses a CSS-referenced image rather than a plain
+    /// `<img>`: an `<img>` element self-heals through its own JS lifecycle
+    /// (`setAttribute("src", ...)` schedules `op_load_image_metadata`
+    /// independent of any DOM walk), so it is not a valid discriminator for
+    /// this bug. A CSS `background-image` has no such element-owned op — it
+    /// is only ever discovered by `render_resource_candidates()`'s DOM/CSS
+    /// walk (img/video plus `<style>`/`style=""`/`<use>` URL extraction).
+    /// Before the fix, nothing re-invokes that walk for the rest of the live
+    /// session, so a screenshot taken right after `navigate()` returns
+    /// (mirroring a CDP client that calls `Page.captureScreenshot`
+    /// immediately after `Page.navigate`, with no explicit wait) never
+    /// discovers, let alone loads, the late background image: the pixel
+    /// where it would render stays background white forever, even after
+    /// draining the autonomous pump.
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn autonomous_pump_discovers_a_script_inserted_css_image_after_navigation_settles() {
+        let insert_delay_ms = 150;
+        let address = spawn_delayed_dom_insert_server(insert_delay_ms);
+        let page_url = format!("http://{address}/page");
+        let asset_url = format!("http://{address}/late.svg");
+
+        let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
+            "reswarm-repro".to_string(),
+            None,
+            false,
+            None,
+            None,
+            true,
+        ));
+        let mut page = super::Page::new("reswarm-repro".to_string(), context);
+        page.set_viewport((100.0, 80.0));
+        page.navigate(&page_url).await.unwrap();
+
+        // A screenshot taken the instant navigate() returns must stay a pure
+        // observation (no blocking wait): the style has not been inserted by
+        // the delayed script yet, so this must be blank.
+        let immediate = page.screenshot((100.0, 80.0)).expect("immediate screenshot");
+        assert_eq!(
+            decode_screenshot_pixel(&immediate, 50, 40),
+            [255, 255, 255, 255],
+            "the delayed background image cannot exist yet"
+        );
+
+        // Simulate what the live CDP session does between client commands:
+        // `server.rs`'s connection processor keeps calling
+        // `Page::run_autonomous_event_loop_turn` while the page has JS work
+        // outstanding (here, the pending setTimeout). No explicit settle()
+        // or CLI --wait path is used, matching the CDP navigate/screenshot
+        // path exactly.
+        let pump_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let idle = page.run_autonomous_event_loop_turn().await.unwrap();
+            if idle && !page.has_pending_render_resources() {
+                break;
+            }
+            if std::time::Instant::now() > pump_deadline {
+                break;
+            }
+        }
+
+        assert!(
+            page.js.as_ref().unwrap().render_resource_is_known(&asset_url),
+            "the autonomous pump must have discovered and loaded the late CSS background image"
+        );
+        let later = page.screenshot((100.0, 80.0)).expect("later screenshot");
+        assert_eq!(
+            decode_screenshot_pixel(&later, 50, 40),
+            [255, 0, 0, 255],
+            "the late background image must be visible once the autonomous pump has run"
         );
     }
 

@@ -159,7 +159,7 @@ pub async fn handle(
                     page.evaluate(&code);
                 }
             } else if event_type == "mouseReleased" {
-                let moved_frame = if let Some(page) = ctx.get_session_page_mut(session_id) {
+                let (moved_frame, nav_error) = if let Some(page) = ctx.get_session_page_mut(session_id) {
                     let code = format!(
                         "(function() {{\
                             var target = (document.elementFromPoint && document.elementFromPoint({x},{y})) || globalThis.__obscura_click_target || document.activeElement || document.body;\
@@ -246,43 +246,119 @@ pub async fn handle(
                         shift_key = shift_key,
                     );
                     page.evaluate(&code);
-                    let moved = page
-                        .process_pending_navigation()
-                        .await
-                        .map_err(|e| e.to_string())?;
+                    // `js_epoch` is bumped by `init_js`, so comparing it
+                    // before/after tells us whether this navigation rebuilt
+                    // the JS runtime — a *hard* navigation
+                    // (location.assign/.href=/form submit, queued by
+                    // op_navigate) does; a *soft* one (history.pushState,
+                    // picked up by sync_virtual_url's fallback) stays on the
+                    // same document and runtime. Checking the epoch after
+                    // the call (rather than peeking whether a hard nav was
+                    // *queued* beforehand) also catches the case where the
+                    // runtime was rebuilt and the navigation *then* failed
+                    // later (e.g. a post-load wait timeout): process_pending_
+                    // navigation() returns Err in that case, but the old
+                    // execution context is already gone, so the client still
+                    // has to be told.
+                    let epoch_before = page.js_epoch();
+                    let nav_result = page.process_pending_navigation().await;
+                    let context_rebuilt = page.js_epoch() != epoch_before;
+                    let (moved, nav_error) = match nav_result {
+                        Ok(moved) => (moved, None),
+                        Err(e) if context_rebuilt => (true, Some(e.to_string())),
+                        Err(e) => return Err(e.to_string()),
+                    };
                     // Fork: a single page app answers a click by routing itself,
                     // with no document fetch. The client still has to be told the
                     // frame moved, or the click looks like it did nothing.
-                    if moved {
+                    let frame = if moved {
                         let url = page.url_string();
                         let frame_id = page.frame_id.clone();
-                        Some((page.id.clone(), frame_id, url))
+                        Some((page.id.clone(), frame_id, url, context_rebuilt))
                     } else {
                         None
-                    }
+                    };
+                    (frame, nav_error)
                 } else {
-                    None
+                    (None, None)
                 };
-                if let Some((page_id, frame_id, url)) = moved_frame {
-                    let loader_id = ctx
-                        .current_loader_ids
-                        .get(&page_id)
-                        .cloned()
-                        .unwrap_or_else(|| format!("loader-blank-{page_id}"));
-                    ctx.pending_events.push(crate::types::CdpEvent {
-                        method: "Page.frameNavigated".into(),
-                        params: json!({
-                            "frame": crate::domains::page::frame_value(
-                                &frame_id,
-                                None,
-                                &loader_id,
-                                &url,
-                                "text/html",
-                            ),
-                            "type": "Navigation",
-                        }),
-                        session_id: Some(session_id.clone().unwrap_or_default()),
-                    });
+                if let Some((page_id, frame_id, url, context_rebuilt)) = moved_frame {
+                    if context_rebuilt {
+                        // A click that navigates the page to a new document
+                        // (an <a href> or a form submit) replaces the
+                        // document the same way Page.navigate and
+                        // JS-initiated navigation (emit_post_eval_nav) do: a
+                        // fresh V8 runtime, so every CDP object handle a
+                        // client holds for the old document — including
+                        // Playwright's cached utility-script handle — is
+                        // dead. Emitting only Page.frameNavigated (as
+                        // before) told the client the frame moved but never
+                        // told it the execution context died, so the client
+                        // kept calling Runtime.callFunctionOn with the old
+                        // (now-unresolvable) objectId — surfacing as
+                        // `utilityScript.evaluate is not a function` on
+                        // every later page.evaluate(). Routing through the
+                        // same emit_navigation_events() the other two
+                        // navigation triggers use restores the
+                        // executionContextsCleared/executionContextCreated
+                        // pair the client needs to rebuild its handles.
+                        let loader_id = format!("loader-{}", uuid::Uuid::new_v4());
+                        let (network_events, reached_idle) =
+                            match ctx.get_session_page_mut(session_id) {
+                                Some(p) => (
+                                    p.network_events.drain(..).collect::<Vec<_>>(),
+                                    p.lifecycle.is_network_idle(),
+                                ),
+                                None => (Vec::new(), false),
+                            };
+                        crate::domains::page::emit_navigation_events(
+                            ctx,
+                            session_id,
+                            &frame_id,
+                            &loader_id,
+                            &url,
+                            &page_id,
+                            &network_events,
+                            obscura_browser::lifecycle::WaitUntil::Load,
+                            reached_idle,
+                        );
+                    } else {
+                        // Fork: a single page app answers a click by routing
+                        // itself, with no document fetch and no runtime
+                        // rebuild. The client still has to be told the frame
+                        // moved, or the click looks like it did nothing —
+                        // but the loaderId and execution context are
+                        // unchanged, so only Page.frameNavigated is emitted.
+                        let loader_id = ctx
+                            .current_loader_ids
+                            .get(&page_id)
+                            .cloned()
+                            .unwrap_or_else(|| format!("loader-blank-{page_id}"));
+                        ctx.pending_events.push(crate::types::CdpEvent {
+                            method: "Page.frameNavigated".into(),
+                            params: json!({
+                                "frame": crate::domains::page::frame_value(
+                                    &frame_id,
+                                    None,
+                                    &loader_id,
+                                    &url,
+                                    "text/html",
+                                ),
+                                "type": "Navigation",
+                            }),
+                            session_id: Some(session_id.clone().unwrap_or_default()),
+                        });
+                    }
+                }
+                if let Some(e) = nav_error {
+                    // The context-invalidation events above are emitted
+                    // first, so the client's stale handles are already
+                    // dropped by the time it sees this command fail — only
+                    // then do we surface the navigation error itself (e.g. a
+                    // post-load wait timeout), matching the pre-existing
+                    // contract that a failed navigation fails the triggering
+                    // CDP command.
+                    return Err(e);
                 }
             } else if event_type == "mouseWheel" {
                 let delta_x = params.get("deltaX").and_then(|v| v.as_f64()).unwrap_or(0.0);

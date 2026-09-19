@@ -227,6 +227,13 @@ pub struct Page {
     /// declaration order, so the frames must go first.
     pub frames: Vec<FrameRealm>,
     pub js: Option<ObscuraJsRuntime>,
+    /// Bumped every time `init_js` replaces `js` with a freshly constructed
+    /// runtime. A navigation attempt can rebuild the runtime and then still
+    /// fail later (e.g. a post-load wait that times out) — comparing this
+    /// before/after a fallible navigation call tells a CDP-layer caller
+    /// whether the execution context actually changed, independent of
+    /// whether the navigation itself was reported Ok or Err.
+    js_epoch: u64,
     pub lifecycle: LifecycleState,
     pub http_client: Arc<ObscuraHttpClient>,
     pub context: Arc<BrowserContext>,
@@ -1088,6 +1095,7 @@ impl Page {
             dom: None,
             frames: Vec::new(),
             js: None,
+            js_epoch: 0,
             lifecycle: LifecycleState::Idle,
             http_client,
             context,
@@ -1746,6 +1754,7 @@ impl Page {
             self.frames.clear();
             let _ = self.js.take();
         }
+        self.js_epoch = self.js_epoch.wrapping_add(1);
 
         // Thread the BrowserContext's proxy through to the ES-module loader
         // and op_fetch_url so dynamic imports and JS fetch() honour the
@@ -4626,6 +4635,15 @@ impl Page {
         } else {
             None
         }
+    }
+
+    /// Current `js_epoch`. A caller that drives a fallible navigation call
+    /// (which can rebuild the execution context via `init_js` and *then*
+    /// still fail, e.g. a post-load wait timeout) can snapshot this before
+    /// and after to learn whether the context changed, independent of the
+    /// navigation call's own Ok/Err outcome.
+    pub fn js_epoch(&self) -> u64 {
+        self.js_epoch
     }
 
     pub fn take_pending_binding_calls(&self) -> Vec<(String, String)> {

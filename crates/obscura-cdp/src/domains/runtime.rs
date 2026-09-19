@@ -52,7 +52,23 @@ async fn emit_post_eval_nav(
     let page = ctx
         .get_session_page_mut(session_id)
         .ok_or("No page")?;
-    let did_navigate = page.process_pending_navigation().await.map_err(|e| e.to_string())?;
+    // `js_epoch` is bumped by `init_js`, so comparing it before/after tells
+    // us whether this navigation rebuilt the JS runtime — including the
+    // case where the runtime was rebuilt and the navigation *then* failed
+    // later (e.g. a post-load wait timeout): process_pending_navigation
+    // returns Err in that case, but the old execution context is already
+    // gone, so the client still has to be told, or it keeps calling
+    // Runtime.callFunctionOn with a stale objectId (the
+    // `utilityScript.evaluate is not a function` cascade) even though this
+    // command goes on to surface the navigation error.
+    let epoch_before = page.js_epoch();
+    let nav_result = page.process_pending_navigation().await;
+    let context_rebuilt = page.js_epoch() != epoch_before;
+    let (did_navigate, nav_error) = match nav_result {
+        Ok(moved) => (moved, None),
+        Err(e) if context_rebuilt => (true, Some(e.to_string())),
+        Err(e) => return Err(e.to_string()),
+    };
     if !did_navigate {
         return Ok(());
     }
@@ -78,7 +94,15 @@ async fn emit_post_eval_nav(
         WaitUntil::Load,
         reached_idle,
     );
-    Ok(())
+    match nav_error {
+        // The context-invalidation events above are emitted first, so the
+        // client's stale handles are already dropped by the time it sees
+        // this command fail — only then do we surface the navigation error
+        // itself, matching the pre-existing contract that a failed
+        // navigation fails the triggering CDP command.
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
 }
 
 pub async fn handle(

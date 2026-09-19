@@ -4893,6 +4893,7 @@ fn layout_dom_once(
             legacy_center: bool,
             visibility_hidden: bool,
             has_zero_opacity: bool,
+            pointer_events_none: bool,
             list_style: crate::ListStyle,
             line_height: crate::LineHeight,
             white_space: crate::WhiteSpace,
@@ -4945,6 +4946,7 @@ fn layout_dom_once(
                     legacy_center: false,
                     visibility_hidden: false,
                     has_zero_opacity: false,
+                    pointer_events_none: false,
                     // CSS initial value of list-style-type.
                     list_style: crate::ListStyle::Disc,
                     line_height: crate::LineHeight::Normal,
@@ -5248,6 +5250,10 @@ fn layout_dom_once(
                 match style.color {
                     Some(c) => inh.color = Some(c),
                     None => style.color = inh.color,
+                }
+                match style.pointer_events_none {
+                    Some(v) => inh.pointer_events_none = v,
+                    None => style.pointer_events_none = Some(inh.pointer_events_none),
                 }
                 // Resolve a relative font-size against the PARENT (em/%) or
                 // ROOT (rem) font-size before inheriting it downward.

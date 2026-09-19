@@ -1448,6 +1448,15 @@ impl PreparedRender {
         );
         out.insert("opacity", css_number(style.opacity.unwrap_or(1.0)));
         out.insert(
+            "pointer-events",
+            if style.pointer_events_none.unwrap_or(false) {
+                "none"
+            } else {
+                "auto"
+            }
+            .to_string(),
+        );
+        out.insert(
             "background-color",
             css_color(style.background_color.unwrap_or([0, 0, 0, 0])),
         );
@@ -15769,6 +15778,45 @@ mod tests {
         // to `auto`, not `visible` (CSS Overflow Module Level 3 coupling).
         assert_eq!(computed("mixed")["overflow-x"], "hidden");
         assert_eq!(computed("mixed")["overflow-y"], "auto");
+    }
+
+    // R-15: `pointer-events` is a real inherited CSS property (CSS Basic User
+    // Interface Module Level 3, section 14.1), but its computed value never made it
+    // into `getComputedStyle()` at all -- every element reported the JS-side
+    // default of "auto" regardless of the authored declaration. That broke
+    // hit-testing (`Document.elementFromPoint`'s own `pointer-events:none`
+    // filter never triggered), so a real-world `pointer-events-none` overlay
+    // absorbed every click meant for the content underneath it.
+    #[test]
+    fn computed_style_reports_declared_pointer_events_and_inherits_it() {
+        let tree = parse_html(
+            r#"<div id="none-wrapper" style="pointer-events:none">
+                 <span id="inherited"></span>
+                 <span id="override" style="pointer-events:auto"></span>
+               </div>
+               <div id="plain"></div>"#,
+        );
+        let mut resources = RenderResourceCache::default();
+        let prepared =
+            prepare_dom(&tree, (320.0, 200.0), None, &mut resources).expect("prepared render");
+        let computed = |id| {
+            prepared
+                .computed_style(tree.get_element_by_id(id).unwrap())
+                .expect("computed style")
+        };
+
+        assert_eq!(computed("plain")["pointer-events"], "auto");
+        assert_eq!(computed("none-wrapper")["pointer-events"], "none");
+        assert_eq!(
+            computed("inherited")["pointer-events"],
+            "none",
+            "a descendant that does not declare its own pointer-events must inherit \"none\""
+        );
+        assert_eq!(
+            computed("override")["pointer-events"],
+            "auto",
+            "an own declaration must win over the inherited value"
+        );
     }
 
     #[test]

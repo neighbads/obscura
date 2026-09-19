@@ -1486,6 +1486,7 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
             };
         }
         "visibility" => style.visibility_hidden = Some(value.eq_ignore_ascii_case("hidden")),
+        "pointer-events" => style.pointer_events_none = Some(value.eq_ignore_ascii_case("none")),
         "opacity" => style.opacity = value.trim().parse::<f32>().ok(),
         "animation" => apply_animation_shorthand(style, value),
         "animation-name" => {

@@ -1425,6 +1425,15 @@ pub struct LayoutStyle {
     /// a real inherited CSS property). Resolved into `effectively_invisible`
     /// during `dom::layout_dom`'s inheritance pass.
     pub visibility_hidden: Option<bool>,
+    /// `pointer-events: none|auto`, `true` meaning `none`. CSS Basic User
+    /// Interface Module Level 3 defines `pointer-events` as an inherited
+    /// property; `None` here means "inherit the ancestor's computed value",
+    /// resolved in place by `dom::layout_dom`'s inheritance pass the same way
+    /// `color`/`font-size` are (unlike `visibility_hidden` above, which is
+    /// left as an own-value flag and resolved separately into
+    /// `effectively_invisible`). `getComputedStyle` and hit-testing
+    /// (`elementFromPoint`) both read this resolved value.
+    pub pointer_events_none: Option<bool>,
     /// `opacity`, own (non-inherited) value in 0.0-1.0. `None` means the
     /// default of 1.0.
     pub opacity: Option<f32>,

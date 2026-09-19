@@ -347,6 +347,16 @@ pub async fn handle(
             let key = params.get("key").and_then(|v| v.as_str()).unwrap_or("");
             let code = params.get("code").and_then(|v| v.as_str()).unwrap_or("");
             let text = params.get("text").and_then(|v| v.as_str()).unwrap_or("");
+            // Chrome derives KeyboardEvent.keyCode/which from this CDP field;
+            // Playwright always sends it (13 for Enter, 8 for Backspace, ...).
+            // Pages that predate `event.key` — Bing's own Enter-to-search
+            // handler among them — still gate on the legacy `keyCode`/`which`
+            // number, so leaving it unset (0 for every key) makes those
+            // handlers silently never run.
+            let key_code = params
+                .get("windowsVirtualKeyCode")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
 
             if let Some(page) = ctx.get_session_page_mut(session_id) {
                 match event_type {
@@ -354,8 +364,9 @@ pub async fn handle(
                         let js = format!(
                             "(function() {{\
                                 var target = document.activeElement || document.body;\
-                                var evt = globalThis.__obscura_markTrusted(new KeyboardEvent('keydown', {{bubbles:true,cancelable:true,key:{key},code:{code}}}));\
+                                var evt = globalThis.__obscura_markTrusted(new KeyboardEvent('keydown', {{bubbles:true,cancelable:true,key:{key},code:{code},keyCode:{key_code},which:{key_code}}}));\
                                 target.dispatchEvent(evt);\
+                                return evt.defaultPrevented;\
                             }})()",
                             // Escape backslash BEFORE single-quote (as the text
                             // path below does) so a key like "\" — Chrome's
@@ -363,37 +374,48 @@ pub async fn handle(
                             // and produce a syntax error that drops the event.
                             key = js_str(key),
                             code = js_str(code),
+                            key_code = key_code,
                         );
-                        page.evaluate(&js);
+                        let keydown_prevented = page.evaluate(&js).as_bool().unwrap_or(false);
 
                         if !text.is_empty() && text != "\r" && text != "\n" {
                             page.evaluate(&insert_text_js(text));
                         }
 
-                        if key == "Enter" {
-                            // In a textarea Enter inserts a newline; in input fields
-                            // it submits the containing form. Real Chrome distinguishes
-                            // these two and we should too: previously every Enter tried
-                            // to submit the nearest form even from a textarea.
-                            let js = "(function() {\
-                                var target = document.activeElement;\
-                                if (!target) return;\
-                                target.dispatchEvent(globalThis.__obscura_markTrusted(new KeyboardEvent('keypress', {bubbles:true,key:'Enter',code:'Enter'})));\
-                                if (target.localName === 'textarea') {\
-                                    var value = target.value || '';\
-                                    var start = target.selectionStart, end = target.selectionEnd;\
-                                    start = start == null ? value.length : Math.max(0, Math.min(start, value.length));\
-                                    end = end == null ? start : Math.max(0, Math.min(end, value.length));\
-                                    var lower = Math.min(start, end), upper = Math.max(start, end);\
-                                    globalThis.__obscura_setFieldValue(target, 'value', value.slice(0, lower) + '\\n' + value.slice(upper));\
-                                    target.setSelectionRange(lower + 1, lower + 1);\
-                                    target.dispatchEvent(globalThis.__obscura_markTrusted(new Event('input', {bubbles:true})));\
-                                } else {\
-                                    var form = target.form || (target.closest && target.closest('form'));\
-                                    if (form) {{ try {{ if (typeof form.requestSubmit === 'function') {{ form.requestSubmit(); }} else {{ form.submit(); }} }} catch(e) {{}} }}\
-                                }\
-                            })()";
-                            page.evaluate(js);
+                        // In a textarea Enter inserts a newline; in input fields
+                        // it submits the containing form. Real Chrome distinguishes
+                        // these two and we should too: previously every Enter tried
+                        // to submit the nearest form even from a textarea. Real
+                        // Chrome also runs neither default action when the page's
+                        // own keydown/keypress handler calls preventDefault() — a
+                        // textarea styled as a single-line search box (Bing's
+                        // #sb_form_q) relies on that to intercept Enter and submit
+                        // its own way instead of getting a literal "\n" inserted.
+                        if key == "Enter" && !keydown_prevented {
+                            let js = format!(
+                                "(function() {{\
+                                    var target = document.activeElement;\
+                                    if (!target) return;\
+                                    var evt = globalThis.__obscura_markTrusted(new KeyboardEvent('keypress', {{bubbles:true,cancelable:true,key:'Enter',code:'Enter',keyCode:{key_code},which:{key_code}}}));\
+                                    target.dispatchEvent(evt);\
+                                    if (evt.defaultPrevented) return;\
+                                    if (target.localName === 'textarea') {{\
+                                        var value = target.value || '';\
+                                        var start = target.selectionStart, end = target.selectionEnd;\
+                                        start = start == null ? value.length : Math.max(0, Math.min(start, value.length));\
+                                        end = end == null ? start : Math.max(0, Math.min(end, value.length));\
+                                        var lower = Math.min(start, end), upper = Math.max(start, end);\
+                                        globalThis.__obscura_setFieldValue(target, 'value', value.slice(0, lower) + '\\n' + value.slice(upper));\
+                                        target.setSelectionRange(lower + 1, lower + 1);\
+                                        target.dispatchEvent(globalThis.__obscura_markTrusted(new Event('input', {{bubbles:true}})));\
+                                    }} else {{\
+                                        var form = target.form || (target.closest && target.closest('form'));\
+                                        if (form) {{ try {{ if (typeof form.requestSubmit === 'function') {{ form.requestSubmit(); }} else {{ form.submit(); }} }} catch(e) {{}} }}\
+                                    }}\
+                                }})()",
+                                key_code = key_code,
+                            );
+                            page.evaluate(&js);
                         }
 
                         if key == "Backspace" {
@@ -404,11 +426,12 @@ pub async fn handle(
                         let js = format!(
                             "(function() {{\
                                 var target = document.activeElement || document.body;\
-                                var evt = globalThis.__obscura_markTrusted(new KeyboardEvent('keyup', {{bubbles:true,key:{key},code:{code}}}));\
+                                var evt = globalThis.__obscura_markTrusted(new KeyboardEvent('keyup', {{bubbles:true,key:{key},code:{code},keyCode:{key_code},which:{key_code}}}));\
                                 target.dispatchEvent(evt);\
                             }})()",
                             key = js_str(key),
                             code = js_str(code),
+                            key_code = key_code,
                         );
                         page.evaluate(&js);
                     }

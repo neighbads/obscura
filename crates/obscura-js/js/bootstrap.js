@@ -10242,7 +10242,7 @@ globalThis.MouseEvent = class extends Event {
   }
 };
 globalThis.KeyboardEvent = class extends Event {
-  constructor(t,o={}) { super(t,o);this.view=o.view||null;this.detail=o.detail||0;this.key=o.key||"";this.code=o.code||"";this.location=o.location||0;this.ctrlKey=!!o.ctrlKey;this.altKey=!!o.altKey;this.shiftKey=!!o.shiftKey;this.metaKey=!!o.metaKey;this.repeat=!!o.repeat; }
+  constructor(t,o={}) { super(t,o);this.view=o.view||null;this.detail=o.detail||0;this.key=o.key||"";this.code=o.code||"";this.location=o.location||0;this.ctrlKey=!!o.ctrlKey;this.altKey=!!o.altKey;this.shiftKey=!!o.shiftKey;this.metaKey=!!o.metaKey;this.repeat=!!o.repeat;this.keyCode=o.keyCode||0;this.which=o.which||o.keyCode||0;this.charCode=t==="keypress"?(o.keyCode||0):0; }
   // Legacy DOM Level 3 initializer. Positional signature per the WebKit/Gecko form.
   initKeyboardEvent(type,canBubble,cancelable,view,key,location,ctrlKey,altKey,shiftKey,metaKey) {
     if (arguments.length < 1) throw new TypeError("Failed to execute 'initKeyboardEvent' on 'KeyboardEvent': 1 argument required, but only 0 present.");

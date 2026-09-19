@@ -40,7 +40,7 @@ fn insert_text_js(text: &str) -> String {
                 var caret = lo + ins.length;\
                 t.setSelectionRange(caret, caret);\
             }}\
-            t.dispatchEvent(globalThis.__obscura_markTrusted(new Event('input', {{bubbles:true}})));\
+            t.dispatchEvent(globalThis.__obscura_markTrusted(new InputEvent('input', {{bubbles:true,composed:true,inputType:'insertText',data:{text}}})));\
         }})()",
         text = literal,
     )
@@ -78,7 +78,7 @@ const BACKSPACE_JS: &str = "(function() {\
             t.setSelectionRange(s - d, s - d);\
         }\
     }\
-    t.dispatchEvent(globalThis.__obscura_markTrusted(new Event('input', {bubbles:true})));\
+    t.dispatchEvent(globalThis.__obscura_markTrusted(new InputEvent('input', {bubbles:true,composed:true,inputType:'deleteContentBackward',data:null})));\
 })()";
 
 fn mouse_button_code(button: &str) -> u8 {
@@ -456,7 +456,31 @@ pub async fn handle(
 
 #[cfg(test)]
 mod tests {
-    use super::js_str;
+    use super::{insert_text_js, js_str, BACKSPACE_JS};
+
+    // R-03 — typed text and backspace must dispatch a spec-compliant
+    // `InputEvent` (composed, with `inputType`/`data`), not a generic
+    // `Event`. Frameworks that branch on `instanceof InputEvent` or read
+    // `inputType`/`data` (e.g. MediaWiki's search suggestion widget) never
+    // observe a generic `input` Event.
+    #[test]
+    fn insert_text_js_dispatches_an_input_event_with_insert_text_type() {
+        let js = insert_text_js("R");
+        assert!(
+            js.contains("new InputEvent('input', {bubbles:true,composed:true,inputType:'insertText',data:"),
+            "expected a composed InputEvent with inputType:'insertText', got: {js}"
+        );
+    }
+
+    #[test]
+    fn backspace_js_dispatches_an_input_event_with_delete_content_backward_type() {
+        assert!(
+            BACKSPACE_JS.contains(
+                "new InputEvent('input', {bubbles:true,composed:true,inputType:'deleteContentBackward',data:null})"
+            ),
+            "expected a composed InputEvent with inputType:'deleteContentBackward', got: {BACKSPACE_JS}"
+        );
+    }
 
     // SEC-501 / #819 — key/code are embedded via js_str; it must escape control
     // characters (newline/CR/tab/NUL/U+2028-29), not just backslash and quote,

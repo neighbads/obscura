@@ -5993,8 +5993,11 @@ fn layout_dom_once(
                 let element = node.as_element()?;
                 (element.local.as_ref() == "button"
                     && style.width == crate::Dimension::Auto
-                    && container_auto_inline_size(tree, id, style, &styles)
-                        != ContainerAutoInlineSize::StretchedGridItem)
+                    && !matches!(
+                        container_auto_inline_size(tree, id, style, &styles),
+                        ContainerAutoInlineSize::StretchedGridItem
+                            | ContainerAutoInlineSize::StretchedFlexItem
+                    ))
                     .then(|| {
                         let font_size = style.font_size.unwrap_or(13.333_333).max(1.0);
                         (
@@ -11796,6 +11799,7 @@ enum ContainerAutoInlineSize {
     FillAvailable,
     Intrinsic,
     StretchedGridItem,
+    StretchedFlexItem,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -11904,7 +11908,7 @@ fn container_auto_inline_size(
             } else if used_flex_alignment(style.align_self, parent_style.align_items)
                 == taffy::AlignSelf::STRETCH
             {
-                ContainerAutoInlineSize::FillAvailable
+                ContainerAutoInlineSize::StretchedFlexItem
             } else {
                 ContainerAutoInlineSize::Intrinsic
             }
@@ -11999,7 +12003,7 @@ fn apply_container_size_containment(
             ContainerAutoInlineSize::StretchedGridItem => {
                 taffy_style.intrinsic_size_containment.width = true;
             }
-            ContainerAutoInlineSize::FillAvailable => {}
+            ContainerAutoInlineSize::FillAvailable | ContainerAutoInlineSize::StretchedFlexItem => {}
         }
     }
 
@@ -15678,6 +15682,43 @@ mod tests {
             (rect("icon").width - 32.0).abs() < 0.1,
             "the in-flow 16px SVG and horizontal padding must contribute: {:?}",
             rect("icon")
+        );
+    }
+
+    #[test]
+    // R-15: a `<button>` that is itself `display:flex` and a child of a
+    // column flex container inheriting the default cross-axis alignment
+    // (`align-items` initial value `normal`, which CSS Box Alignment Level 3
+    // section 8.3 defines as computing to `stretch` for flex items) must
+    // stretch to the container's cross size like any other auto-width flex
+    // item (CSS Flexbox Level 1 section 9.4, "Cross Size Determination").
+    // The native-button intrinsic-width heuristic previously only exempted
+    // grid-stretched buttons and always overwrote a flex-stretched button's
+    // `width:auto` with its shrink-to-fit content width, clipping the label.
+    fn stretched_flex_column_button_fills_the_container_width_not_its_label() {
+        let tree = parse_html(
+            r#"<style>
+                html,body{margin:0}
+                .col{display:flex;flex-direction:column;width:390px}
+                .btn{display:flex;align-items:center;justify-content:center;height:40px}
+                .block-btn{display:flex;align-items:center;justify-content:center;height:40px}
+              </style>
+              <div class="col">
+                <button class="btn" id="stretched">Show other options</button>
+              </div>
+              <button class="block-btn" id="unstretched">Show other options</button>"#,
+        );
+        let laid = layout_dom(&tree, (1200.0, 600.0));
+        let rect = |id: &str| laid.rects[&tree.get_element_by_id(id).unwrap()];
+        assert!(
+            (rect("stretched").width - 390.0).abs() < 0.1,
+            "a flex item button with align-items:stretch must fill the column's cross size: {:?}",
+            rect("stretched")
+        );
+        assert!(
+            rect("unstretched").width < 300.0,
+            "a button that is not a stretched flex/grid item stays intrinsically sized: {:?}",
+            rect("unstretched")
         );
     }
 

@@ -15782,6 +15782,43 @@ mod tests {
     }
 
     #[test]
+    fn test_focus_and_blur_dispatch_focus_events() {
+        // HTMLElement.focus()/.blur() must dispatch the spec focus algorithm
+        // events (focus/blur non-bubbling, focusin/focusout bubbling) so that
+        // document-level `focusin` listeners (used e.g. by MediaWiki's
+        // Vector-2022 skin to lazily mount its search-suggestion widget) fire.
+        let mut rt = setup_runtime(r#"<input id="a"><input id="b">"#);
+        let result = rt
+            .evaluate(
+                r#"
+            const log = [];
+            const a = document.getElementById('a');
+            const b = document.getElementById('b');
+            document.addEventListener('focusin', e => log.push('doc-focusin:' + e.target.id));
+            document.addEventListener('focusout', e => log.push('doc-focusout:' + e.target.id));
+            a.addEventListener('focus', () => log.push('a-focus'));
+            a.addEventListener('blur', () => log.push('a-blur'));
+            a.focus();
+            b.focus();
+            b.blur();
+            return log;
+        "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([
+                "a-focus",
+                "doc-focusin:a",
+                "a-blur",
+                "doc-focusout:a",
+                "doc-focusin:b",
+                "doc-focusout:b",
+            ])
+        );
+    }
+
+    #[test]
     fn test_label_click_activates_its_labeled_control() {
         let mut rt = setup_runtime(
             r#"<label id="explicit" for="a">a</label><input type="checkbox" id="a">

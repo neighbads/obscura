@@ -3961,8 +3961,24 @@ class Element extends Node {
       }
     }
   }
-  focus() { globalThis.__obscura_focused = this; globalThis.__obscura_click_target = this; }
-  blur() { if (globalThis.__obscura_focused === this) globalThis.__obscura_focused = null; }
+  focus() {
+    const _prev = globalThis.__obscura_focused;
+    if (_prev === this) return;
+    globalThis.__obscura_focused = this;
+    globalThis.__obscura_click_target = this;
+    if (_prev) {
+      _prev.dispatchEvent(globalThis.__obscura_markTrusted(new FocusEvent('blur', { relatedTarget: this })));
+      _prev.dispatchEvent(globalThis.__obscura_markTrusted(new FocusEvent('focusout', { bubbles: true, relatedTarget: this })));
+    }
+    this.dispatchEvent(globalThis.__obscura_markTrusted(new FocusEvent('focus', { relatedTarget: _prev || null })));
+    this.dispatchEvent(globalThis.__obscura_markTrusted(new FocusEvent('focusin', { bubbles: true, relatedTarget: _prev || null })));
+  }
+  blur() {
+    if (globalThis.__obscura_focused !== this) return;
+    globalThis.__obscura_focused = null;
+    this.dispatchEvent(globalThis.__obscura_markTrusted(new FocusEvent('blur', { relatedTarget: null })));
+    this.dispatchEvent(globalThis.__obscura_markTrusted(new FocusEvent('focusout', { bubbles: true, relatedTarget: null })));
+  }
 
   // --- Popover API (HTML "popover") ---------------------------------------
   // Read the popover content attribute case-insensitively. The HTML parser

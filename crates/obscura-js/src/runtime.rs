@@ -19392,6 +19392,50 @@ mod tests {
         );
     }
 
+    // R-23: CSS 2.1 Appendix E ("Elaborate description of Stacking
+    // Contexts") paints positioned elements above normal in-flow,
+    // non-positioned content regardless of document order. elementFromPoint
+    // used document order as the sole tiebreak between two unrelated,
+    // overlapping candidates, so a `position:fixed` element earlier in the
+    // DOM lost hit testing to a later, plain in-flow sibling it visually
+    // covers (github.com's fixed marketing header vs. the hero section
+    // beneath it — a real click on the header's search button hit the hero
+    // section instead, and the search overlay never opened).
+    #[test]
+    fn test_element_from_point_prefers_positioned_element_over_later_static_sibling() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let id = rt
+            .evaluate(
+                "(function() {
+                    var rect = {
+                        x: 0, y: 0, width: 100, height: 50,
+                        top: 0, left: 0, right: 100, bottom: 50,
+                        toJSON() { return this; },
+                    };
+                    var header = document.createElement('header');
+                    header.id = 'header';
+                    header.style.position = 'fixed';
+                    header.style.zIndex = '99';
+                    header.getBoundingClientRect = function() { return rect; };
+                    document.body.appendChild(header); // earlier in document order
+
+                    var section = document.createElement('section');
+                    section.id = 'section';
+                    section.getBoundingClientRect = function() { return rect; };
+                    document.body.appendChild(section); // later in document order, plain flow
+
+                    return document.elementFromPoint(10, 10).id;
+                })()",
+            )
+            .unwrap();
+        assert_eq!(
+            id,
+            serde_json::json!("header"),
+            "a position:fixed element must win hit testing over an unrelated, later, \
+             non-positioned sibling it visually covers, not the other way around"
+        );
+    }
+
     // R-18: `document.body`/`document.documentElement` are not O(1) cached
     // the way real Chrome's are (`body` re-runs a full `querySelector("body")`
     // scan every access). elementFromPoint used to read `this.body` inside

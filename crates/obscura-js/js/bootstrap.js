@@ -15925,6 +15925,32 @@ if (typeof Document !== 'undefined' && !Document.prototype.elementFromPoint) {
     // presenting as an unresponsive hang (booking.com repro).
     var docBody = this.body;
     var docEl = this.documentElement;
+    // CSS 2.1 Appendix E ("Elaborate description of Stacking Contexts"):
+    // positioned elements (and the stacking contexts they establish) paint
+    // above normal in-flow, non-positioned content regardless of document
+    // order, and among positioned elements a higher z-index paints above a
+    // lower one. Document order is only a valid paint-order proxy *within*
+    // one layer (two unpositioned siblings, or two positioned siblings with
+    // equal z-index). Used unconditionally below, the "last in document
+    // order wins" tiebreak made a `position:fixed` header lose hit-testing
+    // to an unrelated, later `<section>` in normal flow that it visually
+    // covers (e.g. a fixed nav bar over page content it's stacked on top
+    // of), so a real click on the fixed header hit the section behind it
+    // instead.
+    function paintLayerOf(el) {
+      var node = el;
+      while (node && node !== docEl && node !== docBody) {
+        var st = null;
+        try { st = getComputedStyle(node); } catch (_e) {}
+        if (st && st.position && st.position !== 'static') {
+          var z = parseInt(st.zIndex, 10);
+          return { positioned: true, z: isNaN(z) ? 0 : z };
+        }
+        node = node.parentElement;
+      }
+      return { positioned: false, z: 0 };
+    }
+    var candidateLayers = [];
     for (var i = 0; i < all.length; i++) {
       var el = all[i];
       if (!el || !el.getBoundingClientRect) continue;
@@ -15977,24 +16003,33 @@ if (typeof Document !== 'undefined' && !Document.prototype.elementFromPoint) {
         }
         if (!visible) continue;
         candidates.push(el);
+        candidateLayers.push(paintLayerOf(el));
       }
     }
     // The correct hit is whichever candidate is not an ancestor of any other
     // candidate — i.e. the most-nested one actually under the point. That
     // still leaves ties between candidates that aren't nested in each other
     // at all (two unrelated, overlapping siblings, e.g. a positioned box
-    // drawn over a plain document flow div). querySelectorAll('*') walks in
-    // document order, which for unpositioned/unstyled siblings is also paint
-    // order — later elements paint on top of earlier ones — so break such
-    // ties toward the last qualifying candidate, not the first.
+    // drawn over a plain document flow div): resolve those by paint layer
+    // first (see paintLayerOf above), then by document order — later
+    // elements paint on top of earlier ones within the same layer — so
+    // break same-layer ties toward the last qualifying candidate.
     var best = null;
+    var bestLayer = null;
     for (var j = candidates.length - 1; j >= 0; j--) {
       var c = candidates[j];
       var isAncestorOfOther = false;
       for (var k = 0; k < candidates.length; k++) {
         if (k !== j && c.contains(candidates[k])) { isAncestorOfOther = true; break; }
       }
-      if (!isAncestorOfOther) { best = c; break; }
+      if (isAncestorOfOther) continue;
+      var layer = candidateLayers[j];
+      if (best === null ||
+          (layer.positioned && !bestLayer.positioned) ||
+          (layer.positioned === bestLayer.positioned && layer.positioned && layer.z > bestLayer.z)) {
+        best = c;
+        bestLayer = layer;
+      }
     }
     return best || docBody || docEl || null;
   };

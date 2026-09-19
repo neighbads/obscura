@@ -3,6 +3,7 @@ use std::pin::Pin;
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
 
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use deno_core::error::ModuleLoaderError;
 use deno_core::ModuleLoadOptions;
 use deno_core::ModuleLoadReferrer;
@@ -152,6 +153,59 @@ fn io_err(msg: String) -> ModuleLoaderError {
     JsErrorBox::from_err(std::io::Error::new(std::io::ErrorKind::Other, msg))
 }
 
+/// Decodes a `data:` URL per RFC 2397 into its media type (if any) and raw
+/// body bytes. obscura-browser has an identical helper for `data:`
+/// navigation/`<script src>`, but obscura-js cannot depend on obscura-browser
+/// (the dependency runs the other way), so this is a small local copy.
+fn decode_data_url(url: &str) -> Option<(Option<String>, Vec<u8>)> {
+    let rest = url.strip_prefix("data:")?;
+    let comma = rest.find(',')?;
+    let meta = &rest[..comma];
+    let payload = &rest[comma + 1..];
+    let is_base64 = meta.split(';').any(|t| t.eq_ignore_ascii_case("base64"));
+    let content_type: Vec<&str> = meta
+        .split(';')
+        .filter(|t| !t.eq_ignore_ascii_case("base64"))
+        .collect();
+    let content_type = (!content_type.is_empty()).then(|| content_type.join(";"));
+    let bytes = if is_base64 {
+        let cleaned: String = payload.chars().filter(|c| !c.is_whitespace()).collect();
+        BASE64.decode(cleaned).ok()?
+    } else {
+        percent_decode(payload)
+    };
+    Some((content_type, bytes))
+}
+
+fn percent_decode(s: &str) -> Vec<u8> {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            let hi = hex_val(b[i + 1]);
+            let lo = hex_val(b[i + 2]);
+            if let (Some(h), Some(l)) = (hi, lo) {
+                out.push((h << 4) | l);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    out
+}
+
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
 impl ModuleLoader for ObscuraModuleLoader {
     fn resolve(
         &self,
@@ -220,6 +274,34 @@ impl ModuleLoader for ObscuraModuleLoader {
                     "Failed to fetch dynamically imported module {}: blob URL not found",
                     url
                 ))),
+            });
+        }
+
+        // `data:` URLs embed the module's bytes in the specifier itself
+        // (RFC 2397). The Fetch spec's "scheme fetch" algorithm has a `data`
+        // branch that resolves these without a network request, and "fetch a
+        // single module script" does not restrict module specifiers to
+        // http/https/file — Node.js and every major browser support
+        // `import("data:text/javascript,...")`. Routing one to the network
+        // client below always fails ("Forbidden URL scheme 'data'"), a
+        // page-visible bug (Reddit's bot-challenge script loads a module
+        // this way). Decoding here avoids the fetch path entirely, matching
+        // the `blob:` handling just above. This only concerns module/
+        // sub-resource loads — top-level *navigation* to `data:` remains
+        // handled elsewhere and is intentionally untouched.
+        if module_specifier.scheme() == "data" {
+            self.loaded_specifiers.borrow_mut().push(url.clone());
+            return ModuleLoadResponse::Sync(match decode_data_url(&url) {
+                Some((content_type, bytes)) => {
+                    let code = obscura_net::decode_non_html(&bytes, content_type.as_deref());
+                    Ok(ModuleSource::new(
+                        deno_core::ModuleType::JavaScript,
+                        ModuleSourceCode::String(code.into()),
+                        module_specifier,
+                        None,
+                    ))
+                }
+                None => Err(io_err(format!("Invalid data URL module {}", url))),
             });
         }
 

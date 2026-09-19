@@ -18,6 +18,17 @@ use crate::dispatch::{self, CdpContext};
 // is reached we return an explicit error response rather than silently dropping.
 const MAX_DEFERRED_MESSAGES: usize = 256;
 
+// R-22: script-execution watchdog budget (ms) for a navigation the client
+// never asked for (an auto-detected JS-triggered redirect, replayed via
+// `process_with_interception` with `send_command_response == false`). The
+// page is unavailable to every other in-flight client command for this
+// whole navigation, so it must not borrow the ~30s budget meant for a
+// navigation the client explicitly initiated and is prepared to wait on;
+// that mismatch let a background redirect's anti-bot script hold a page
+// hostage long enough that unrelated client commands (e.g. a screenshot)
+// always timed out first.
+const AUTONOMOUS_NAV_SCRIPT_DEADLINE_MS: u64 = 5_000;
+
 // The WS-stream forwarding channel must also be bounded: if the LocalSet
 // (CDP processor + nav tasks) stalls, the accept thread keeps pushing
 // `std::net::TcpStream`s into the queue. An unbounded channel would let
@@ -1582,6 +1593,10 @@ async fn process_with_interception(
         page.set_intercept_tx(tx.clone());
     }
 
+    if !send_command_response {
+        page.set_script_deadline_override_ms(Some(AUTONOMOUS_NAV_SCRIPT_DEADLINE_MS));
+    }
+
     let session_for_events = req.session_id.clone();
     let frame_id = page.frame_id.clone();
     let loader_id = format!("loader-{}", uuid::Uuid::new_v4());
@@ -1986,6 +2001,7 @@ mod tests {
     };
     #[cfg(feature = "render")]
     use super::{pump_and_forward_screencast_frames, pump_live_page_event_loop};
+    use base64::Engine as _;
     use obscura_net::{CookieInfo, CookieJar};
     use serde_json::json;
     use std::collections::HashMap;
@@ -2177,6 +2193,181 @@ mod tests {
                         break;
                     }
                 }
+
+                drop(server_tx);
+                tokio::time::timeout(std::time::Duration::from_secs(2), processor)
+                    .await
+                    .expect("processor shutdown timeout")
+                    .expect("processor task");
+            })
+            .await;
+    }
+
+    // R-22 regression: a JS-triggered re-navigation the client never asked
+    // for (auto-detected via `take_live_pending_navigation` and replayed
+    // with `send_command_response == false`) removes its page from
+    // `ctx.pages` for the navigation's entire duration, so no foreign
+    // command targeting that page can be answered until it completes. Before
+    // the fix, such a re-navigation shared the ~30s script-execution
+    // watchdog budget meant for a navigation the client explicitly
+    // initiated and is prepared to wait on, so a busy-looping redirect
+    // target (e.g. an anti-bot challenge page) could hold an unrelated
+    // client command hostage for up to that long — comfortably past a real
+    // client's own command timeout (Playwright defaults to ~30s measured
+    // from when it issues the command, not from when our navigation
+    // started). This asserts a foreign command sent while such a
+    // re-navigation is in flight is answered well before the old ~30s
+    // ceiling.
+    #[tokio::test(flavor = "current_thread")]
+    async fn autonomous_renavigation_does_not_hold_a_command_hostage_for_the_full_script_budget() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (server_tx, server_rx) = tokio::sync::mpsc::unbounded_channel();
+                let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel();
+                let shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
+                let default_context = crate::dispatch::CdpContext::new().default_context;
+                let processor = tokio::task::spawn_local(super::cdp_processor(
+                    server_rx,
+                    default_context,
+                    shutdown,
+                ));
+
+                server_tx
+                    .send(super::ServerMessage::NewConnection {
+                        reply_tx: reply_tx.clone(),
+                    })
+                    .unwrap();
+                let init = reply_rx.recv().await.expect("processor init");
+                assert!(init.contains("__init"));
+
+                // Measured from here, not from just before sending the foreign
+                // command: the redirect target busy-loops synchronously inside
+                // V8, pinning this test's single OS thread so *nothing* else on
+                // it -- including this test's own subsequent sends and awaits,
+                // not just the deferred command -- can run until the watchdog
+                // (or, with the fix, the shortened budget) releases it. Every
+                // message queued during that stall is delivered in one
+                // microsecond-scale burst the instant the thread frees up, so a
+                // timer started right before sending the foreign command would
+                // only ever measure that final burst, not the real stall.
+                let started = tokio::time::Instant::now();
+
+                let send = |value: serde_json::Value| {
+                    server_tx
+                        .send(super::ServerMessage::Cdp(super::CdpMessage {
+                            text: value.to_string(),
+                            reply_tx: reply_tx.clone(),
+                        }))
+                        .unwrap();
+                };
+                send(json!({
+                    "id": 1,
+                    "method": "Target.createTarget",
+                    "params": {"url": "about:blank"},
+                }));
+
+                let mut session_id = None;
+                loop {
+                    let value: serde_json::Value = serde_json::from_str(
+                        &tokio::time::timeout(std::time::Duration::from_secs(2), reply_rx.recv())
+                            .await
+                            .expect("create target response timeout")
+                            .expect("create target response channel"),
+                    )
+                    .unwrap();
+                    if session_id.is_none() {
+                        session_id = value["params"]["sessionId"].as_str().map(str::to_string);
+                    }
+                    if value["id"] == 1 {
+                        break;
+                    }
+                }
+                let session_id = session_id.expect("attached page session");
+
+                // Redirect target: busy-loops well past any reasonable client
+                // command timeout unless a watchdog cuts it off. It never
+                // finishes on its own inside this test's timeout.
+                let redirect_target_html =
+                    "<script>var s=Date.now();while(Date.now()-s<60000){}</script>";
+                let redirect_target_url = format!(
+                    "data:text/html;base64,{}",
+                    base64::engine::general_purpose::STANDARD.encode(redirect_target_html)
+                );
+                // Redirect asynchronously (setTimeout), so it's picked up by
+                // `take_live_pending_navigation`'s external pump-branch path —
+                // the same path a real JS-triggered redirect (e.g. an anti-bot
+                // challenge's `location.href = ...`) takes. A same-tick
+                // redirect instead takes the internal chain-loop inside
+                // `navigate_with_wait_post_inner`, a different, unaffected
+                // code path.
+                let outer_html = format!(
+                    "<script>setTimeout(function(){{ location.href = '{}'; }}, 10);</script>",
+                    redirect_target_url
+                );
+                send(json!({
+                    "id": 2,
+                    "method": "Page.navigate",
+                    "sessionId": session_id,
+                    "params": {"url": format!("data:text/html,{}", outer_html)},
+                }));
+                loop {
+                    let value: serde_json::Value = serde_json::from_str(
+                        &tokio::time::timeout(std::time::Duration::from_secs(5), reply_rx.recv())
+                            .await
+                            .expect("initial navigate response timeout")
+                            .expect("initial navigate response channel"),
+                    )
+                    .unwrap();
+                    if value["id"] == 2 {
+                        break;
+                    }
+                }
+
+                // Let the setTimeout fire and the connection-owned page pump
+                // detect + start the auto re-navigation well before sending
+                // the foreign command below, so it reliably lands on the
+                // deferred path (see `process_with_interception`'s inner
+                // select loop).
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+                send(json!({
+                    "id": 3,
+                    "method": "Runtime.evaluate",
+                    "sessionId": session_id,
+                    "params": {"expression": "1 + 1", "returnByValue": true},
+                }));
+
+                // No in-process async timeout can preempt this wait: the
+                // redirect target busy-loops synchronously inside V8, which
+                // pins this test's own single OS thread for the same reason
+                // `run_event_loop_bounded`'s doc comment gives for needing a
+                // separate watchdog thread ("`tokio::time::timeout` ... can
+                // only cancel at await points"). Nothing on this thread --
+                // including this test's own sends, sleeps and receives --
+                // makes any progress until the busy loop yields the thread
+                // back, at which point every queued message (including this
+                // command's response) is delivered in one microsecond-scale
+                // burst. So instead of racing a timeout against the receive
+                // (which could never fire early here either), measure elapsed
+                // wall-clock time from connection setup (`started`, above) and
+                // assert on that: well under the old ~30s script-execution
+                // watchdog budget with the fix, at (or near) it without.
+                let value = loop {
+                    let text = reply_rx.recv().await.expect("evaluate response channel");
+                    let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+                    if value["id"] == 3 {
+                        break value;
+                    }
+                };
+                let elapsed = started.elapsed();
+                assert!(
+                    elapsed < std::time::Duration::from_secs(10),
+                    "a foreign command must not be held hostage for anywhere near the \
+                     full script-execution watchdog budget by a JS-triggered \
+                     re-navigation the client never asked for (R-22); took {:?}",
+                    elapsed,
+                );
+                assert_eq!(value["result"]["result"]["value"].as_f64(), Some(2.0));
 
                 drop(server_tx);
                 tokio::time::timeout(std::time::Duration::from_secs(2), processor)

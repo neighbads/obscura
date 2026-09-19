@@ -287,6 +287,16 @@ pub struct Page {
     // contract. Includes `Runtime.addBinding` shims so puppeteer's
     // `exposeFunction` bindings exist before inline `<script>` tags execute.
     preload_scripts: Vec<String>,
+    /// R-22: overrides the script-execution watchdog budget
+    /// (`OBSCURA_SCRIPT_DEADLINE_MS`) for the *next* navigation only. Set by
+    /// the CDP layer for navigations the client never asked for (a
+    /// JS-triggered redirect it auto-detects and replays), where the page is
+    /// unavailable to every other in-flight client command for the whole
+    /// navigation. The normal 30s budget is sized for a navigation the
+    /// client explicitly initiated and is prepared to wait on; reusing it
+    /// for a background redirect the client doesn't know is happening can
+    /// hold its page hostage longer than the client's own command timeout.
+    script_deadline_override_ms: Option<u64>,
     /// Whether at least one attached CDP session enabled the Runtime domain.
     /// Page-owned so the subscription survives replacement of the JS runtime
     /// during navigation.
@@ -1104,6 +1114,7 @@ impl Page {
             blocked_url_patterns: Vec::new(),
             intercept_tx: None,
             preload_scripts: Vec::new(),
+            script_deadline_override_ms: None,
             runtime_events_enabled: std::cell::Cell::new(false),
             console_messages_enabled: std::cell::Cell::new(false),
             pending_frame_work: std::collections::VecDeque::new(),
@@ -2174,10 +2185,18 @@ impl Page {
         // synchronous hang. Raise it further with OBSCURA_SCRIPT_DEADLINE_MS=<ms>
         // for very heavy SPAs on slow networks (pair it with a matching client
         // navigation timeout).
-        let script_deadline_ms: u64 = std::env::var("OBSCURA_SCRIPT_DEADLINE_MS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(30_000);
+        // R-22: a JS-triggered re-navigation the client never asked for
+        // overrides this with a much smaller budget (see
+        // `script_deadline_override_ms` field doc) so its page isn't
+        // unavailable to the client's other in-flight commands for as long
+        // as a navigation the client explicitly initiated and is prepared
+        // to wait on.
+        let script_deadline_ms: u64 = self.script_deadline_override_ms.take().unwrap_or_else(|| {
+            std::env::var("OBSCURA_SCRIPT_DEADLINE_MS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(30_000)
+        });
         let script_deadline =
             tokio::time::Instant::now() + tokio::time::Duration::from_millis(script_deadline_ms);
 
@@ -4648,6 +4667,12 @@ impl Page {
 
     pub fn set_preload_scripts(&mut self, scripts: Vec<String>) {
         self.preload_scripts = scripts;
+    }
+
+    /// R-22: see `script_deadline_override_ms` field doc. Applies to the
+    /// next navigation only; each navigation reads and consumes it.
+    pub fn set_script_deadline_override_ms(&mut self, ms: Option<u64>) {
+        self.script_deadline_override_ms = ms;
     }
 
     /// Append a script that runs in the page before any of the page's own

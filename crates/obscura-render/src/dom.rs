@@ -5010,6 +5010,17 @@ fn layout_dom_once(
             let reused_computed_style = fresh_styles
                 .as_ref()
                 .is_some_and(|fresh| !fresh.contains(&id));
+            // Computed before any mutable borrow of `styles` below: whether
+            // this node's own `height: auto` is nonetheless a definite used
+            // height via flex cross-axis stretch, for propagating to its
+            // percentage-height children (see the function doc comment).
+            let stretched_height_definite = stretched_flex_row_height_is_definite(
+                tree,
+                id,
+                styles.get(&id).and_then(|s| s.align_self),
+                inh.cb_height_definite,
+                &styles,
+            );
             if reused_computed_style {
                 // Retained styles have already passed through this destructive
                 // normalization once. Do not resolve their em/rem/percent or
@@ -5136,7 +5147,8 @@ fn layout_dom_once(
                     child_cb_height_definite = matches!(
                         style.height,
                         crate::Dimension::Px(_) | crate::Dimension::Percent(_)
-                    );
+                    ) || (matches!(style.height, crate::Dimension::Auto)
+                        && stretched_height_definite);
                     if child_cb_height_definite {
                         definite_height_nodes.insert(id);
                     }
@@ -5413,7 +5425,8 @@ fn layout_dom_once(
                 child_cb_height_definite = matches!(
                     style.height,
                     crate::Dimension::Px(_) | crate::Dimension::Percent(_)
-                );
+                ) || (matches!(style.height, crate::Dimension::Auto)
+                    && stretched_height_definite);
                 if child_cb_height_definite {
                     definite_height_nodes.insert(id);
                 }
@@ -11676,6 +11689,42 @@ fn effective_container_type(style: &crate::LayoutStyle) -> crate::ContainerType 
     }
 }
 
+/// Whether a box's own `height: auto` still yields a definite used height
+/// because it is a row flex item stretched by `align-items: stretch` (the
+/// flexbox default) against a flex container whose own height is definite.
+/// CSS treats a stretched flex item's cross size as definite for its
+/// content's percentage resolution even though the item's specified height
+/// stays `auto` (Flexbox's "Definite and Indefinite Sizes"). The top-down
+/// containing-block cascade otherwise only recognizes an explicit Px/Percent
+/// height as definite, so a percentage-height descendant of a stretched
+/// flex item (a common icon-sizing idiom, `svg { height: 100% }` inside an
+/// auto-height flex-item wrapper) would otherwise always collapse to auto.
+#[inline]
+fn stretched_flex_row_height_is_definite(
+    tree: &DomTree,
+    id: NodeId,
+    own_align_self: Option<taffy::AlignSelf>,
+    containing_block_height_definite: bool,
+    styles: &HashMap<NodeId, crate::LayoutStyle>,
+) -> bool {
+    if !containing_block_height_definite {
+        return false;
+    }
+    let Some(parent_id) = rendered_parent(tree, id) else {
+        return false;
+    };
+    let Some(parent_style) = styles.get(&parent_id) else {
+        return false;
+    };
+    let row = parent_style.display == crate::Display::Flex
+        && !parent_style.internal_flex_container
+        && !matches!(
+            parent_style.flex_direction,
+            Some(taffy::FlexDirection::Column | taffy::FlexDirection::ColumnReverse)
+        );
+    row && used_flex_alignment(own_align_self, parent_style.align_items) == taffy::AlignSelf::STRETCH
+}
+
 #[inline]
 fn used_flex_alignment(
     value: Option<taffy::AlignSelf>,
@@ -13693,6 +13742,19 @@ fn run_wrapper_style(parent: &crate::LayoutStyle, has_text_strut: bool) -> taffy
     } else {
         0.0
     };
+    // The run wrapper is an anonymous box representing the parent's own
+    // content area in the taffy tree; it has no counterpart in the real DOM.
+    // When the parent's own height is definite, a percentage-height replaced
+    // descendant (`svg { height: 100% }`, a common icon-sizing idiom) needs
+    // that definiteness to reach taffy's own layout so it can resolve `known`
+    // for the leaf's measure function; taffy does not revisit an auto-sized
+    // node's resolved height once laid out, so leaving this auto would strand
+    // the percentage as indefinite even though the DOM containing block it
+    // stands in for is definite.
+    let height = match parent.height {
+        crate::Dimension::Px(height) => taffy::style::Dimension::length(height),
+        _ => taffy::style::Dimension::auto(),
+    };
     taffy::Style {
         direction: parent.direction.unwrap_or(taffy::Direction::Ltr),
         display: taffy::style::Display::Flex,
@@ -13702,7 +13764,7 @@ fn run_wrapper_style(parent: &crate::LayoutStyle, has_text_strut: bool) -> taffy
         justify_content: justify,
         size: taffy::Size {
             width: taffy::style::Dimension::percent(1.0),
-            height: taffy::style::Dimension::auto(),
+            height,
         },
         // Every CSS line box starts with the parent's font/line-height strut,
         // even when its only atomic inline is shorter (or zero-sized).
@@ -18983,6 +19045,62 @@ mod tests {
         assert!((quote.height - 120.0).abs() < 0.1, "{quote:?}");
         assert!((logo.x - 565.0).abs() < 0.1, "{logo:?}");
         assert!((logo.width - 203.0).abs() < 0.1, "{logo:?}");
+    }
+
+    #[test]
+    fn svg_height_percent_resolves_against_definite_height_wrapper() {
+        // A percentage-height icon SVG (`width:auto;height:100%`, a common
+        // icon-sizing idiom) resolves against an immediate parent with an
+        // explicit CSS height, instead of falling back to the 300x300 CSS
+        // default object size.
+        let tree = parse_html(
+            r#"<style>*{box-sizing:border-box}body{margin:0}#nav{display:flex}.wrap{display:block;width:300px;height:20px}svg{width:auto;height:100%}</style>
+               <div id="nav"><span class="wrap"><svg id="icon" viewBox="0 0 24 24"><path d="M0 0h24v24H0z"/></svg></span></div>"#,
+        );
+        let laid = layout_dom(&tree, (1280.0, 720.0));
+        let rect = laid.rects[&tree.get_element_by_id("icon").unwrap()];
+        assert!((rect.width - 20.0).abs() < 0.1, "{rect:?}");
+        assert!((rect.height - 20.0).abs() < 0.1, "{rect:?}");
+    }
+
+    #[test]
+    fn svg_height_percent_resolves_through_flex_stretched_wrapper() {
+        // Same icon-sizing idiom, but the immediate parent has no explicit
+        // height of its own: its used height instead comes from CSS
+        // Flexbox cross-axis stretch (the default `align-items: stretch`)
+        // against an ancestor flex container with an explicit height. This
+        // stretched size must still resolve the descendant's percentage
+        // height rather than falling back to the 300x300 default object
+        // size (booking.com's real nav icons use exactly this structure).
+        let tree = parse_html(
+            r#"<style>*{box-sizing:border-box}body{margin:0}#nav{display:flex}.outer{display:flex;width:300px;height:20px}.wrap{display:block}svg{width:auto;height:100%}</style>
+               <div id="nav"><span class="outer"><span class="wrap"><svg id="icon" viewBox="0 0 24 24"><path d="M0 0h24v24H0z"/></svg></span></span></div>"#,
+        );
+        let laid = layout_dom(&tree, (1280.0, 720.0));
+        let rect = laid.rects[&tree.get_element_by_id("icon").unwrap()];
+        assert!((rect.width - 20.0).abs() < 0.1, "{rect:?}");
+        assert!((rect.height - 20.0).abs() < 0.1, "{rect:?}");
+    }
+
+    #[test]
+    fn svg_height_percent_resolves_through_anonymous_run_wrapper() {
+        // Same icon-sizing idiom again, but this time the SVG is the sole
+        // child of an inline-level box inside a real inline formatting
+        // context (an anchor), which Obscura wraps in an anonymous taffy
+        // "run wrapper" node standing in for the DOM parent's content area.
+        // That wrapper has no CSS counterpart, so its own taffy height must
+        // still reflect the real parent's definite height or the SVG's
+        // percentage strands as indefinite in taffy's layout even though the
+        // DOM cascade already resolved it (booking.com's real nav icons sit
+        // exactly one inline formatting context deep like this).
+        let tree = parse_html(
+            r##"<style>*{box-sizing:border-box}body{margin:0}.icn{display:inline-block;height:20px}.icn svg{display:inline-block;width:auto;height:100%}</style>
+               <a href="#" style="display:inline-flex;align-items:center"><span class="icn"><svg id="icon" viewBox="0 0 24 24"><path d="M0 0h24v24H0z"/></svg></span></a>"##,
+        );
+        let laid = layout_dom(&tree, (1280.0, 720.0));
+        let rect = laid.rects[&tree.get_element_by_id("icon").unwrap()];
+        assert!((rect.width - 20.0).abs() < 0.1, "{rect:?}");
+        assert!((rect.height - 20.0).abs() < 0.1, "{rect:?}");
     }
 
     #[test]

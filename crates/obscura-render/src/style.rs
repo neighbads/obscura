@@ -1098,11 +1098,14 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
             if !value.trim().is_empty() {
                 style.background_color = None;
                 set_background_gradients(style, value);
-                if style.background_gradient.is_none()
-                    && style.background_radial_gradient.is_none()
-                    && style.background_conic_gradient.is_none()
-                {
-                    style.background_color = parse_color_for_scheme(value, style.color_scheme_dark);
+                // Only the final comma-separated layer may carry a
+                // background-color; earlier layers are image-only. Try the
+                // last layer specifically rather than the whole value, so a
+                // trailing solid color survives alongside earlier gradient
+                // layers (e.g. `background: linear-gradient(...), #2383e2`).
+                if let Some(last) = split_top_level(value, ',').last() {
+                    style.background_color =
+                        parse_color_for_scheme(last, style.color_scheme_dark);
                 }
                 style.background_image = parse_url(value);
                 style.background_size = None;
@@ -10476,6 +10479,20 @@ mod tests {
             contextual.background_size_expression.as_deref(),
             Some("calc(100% - 2rem) auto")
         );
+    }
+
+    #[test]
+    fn background_shorthand_keeps_trailing_color_after_gradient_layer() {
+        // Only the final comma-separated layer of the `background` shorthand
+        // may specify a background-color; a trailing solid color after a
+        // gradient layer must still be applied (e.g. buttons that fall back
+        // to a solid color while a gradient image layer is also present).
+        let s = compute_style(
+            "button",
+            Some("background: linear-gradient(180deg, transparent, transparent), #2383e2"),
+        );
+        assert!(s.background_gradient.is_some());
+        assert_eq!(s.background_color, Some([0x23, 0x83, 0xe2, 255]));
     }
 
     #[test]

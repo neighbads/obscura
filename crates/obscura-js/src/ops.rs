@@ -151,6 +151,14 @@ pub struct ObscuraState {
     // order. Surfaced by `--dump assets` so resources pulled in by script, not
     // just static DOM attributes, are listed (issue #301).
     pub fetched_urls: Vec<String>,
+    /// `URL.createObjectURL` content, keyed by the minted `blob:` URL. Mirrors
+    /// the JS-side `globalThis.__blobStore` so the ES-module loader (which
+    /// runs outside JS and only sees this native state) can resolve a
+    /// `<script type=module src=blob:...>` / dynamic `import(blob:...)`
+    /// locally instead of sending a `blob:` URL to the network client, which
+    /// rejects it outright (issue: Bing's search page loads a bundle chunk
+    /// this way and its bootstrap never finishes).
+    pub blob_store: HashMap<String, String>,
     // Network events for script-initiated requests (fetch/XHR/dynamic resource),
     // drained by the Page into its network_events so the CDP layer emits
     // Network.requestWillBeSent / responseReceived for them (issue #406).
@@ -369,6 +377,7 @@ impl ObscuraState {
             network_response_body_order: VecDeque::new(),
             network_response_body_counter: 0,
             fetched_urls: Vec::new(),
+            blob_store: HashMap::new(),
             js_network_events: Vec::new(),
             pending_frames: Vec::new(),
             pending_frame_bytes: 0,
@@ -5274,6 +5283,24 @@ fn op_binding_called(state: &OpState, #[string] name: &str, #[string] payload: &
         .push((name.to_string(), payload.to_string()));
 }
 
+// Mirrors a `URL.createObjectURL` blob into native state so the ES-module
+// loader can resolve a `blob:` dynamic import/module script locally. Called
+// from the same bootstrap.js code path that fills `globalThis.__blobStore`.
+#[op2(fast)]
+fn op_blob_store_set(state: &OpState, #[string] url: &str, #[string] text: &str) {
+    let gs = state.borrow::<SharedState>().clone();
+    let mut gs = gs.borrow_mut();
+    gs.blob_store.insert(url.to_string(), text.to_string());
+}
+
+// Mirrors `URL.revokeObjectURL`.
+#[op2(fast)]
+fn op_blob_store_delete(state: &OpState, #[string] url: &str) {
+    let gs = state.borrow::<SharedState>().clone();
+    let mut gs = gs.borrow_mut();
+    gs.blob_store.remove(url);
+}
+
 /// Real WebCrypto `crypto.subtle.digest`. `algorithm` is the SubtleCrypto
 /// algorithm name (`SHA-1` / `SHA-256` / `SHA-384` / `SHA-512`, plus the
 /// FIPS 180-4 truncated variants `SHA-512/224` and `SHA-512/256`). The JS
@@ -6059,6 +6086,8 @@ pub fn build_extension() -> Extension {
         op_posted_task(),
         op_posted_task_generation(),
         op_binding_called(),
+        op_blob_store_set(),
+        op_blob_store_delete(),
         op_subtle_digest(),
         op_subtle_hmac(),
         op_subtle_aes_gcm(),

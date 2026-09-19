@@ -193,6 +193,36 @@ impl ModuleLoader for ObscuraModuleLoader {
         options: ModuleLoadOptions,
     ) -> ModuleLoadResponse {
         let url = module_specifier.to_string();
+
+        // `blob:` URLs name a page-local object (`URL.createObjectURL`), not a
+        // network resource: a real browser resolves them from its in-memory
+        // Blob registry. Routing one to the network client below always fails
+        // ("Forbidden URL scheme 'blob'"), breaking `<script type=module
+        // src=blob:...>` / dynamic `import(blob:...)` — a bundler-chunk
+        // pattern pages use to run generated code without eval. Resolve it
+        // synchronously from the state mirror `URL.createObjectURL` writes to
+        // instead of falling through to the fetch path.
+        if module_specifier.scheme() == "blob" {
+            self.loaded_specifiers.borrow_mut().push(url.clone());
+            let found = self.page_state.as_ref().and_then(|weak| {
+                let state = weak.upgrade()?;
+                let state = state.try_borrow().ok()?;
+                state.blob_store.get(&url).cloned()
+            });
+            return ModuleLoadResponse::Sync(match found {
+                Some(code) => Ok(ModuleSource::new(
+                    deno_core::ModuleType::JavaScript,
+                    ModuleSourceCode::String(code.into()),
+                    module_specifier,
+                    None,
+                )),
+                None => Err(io_err(format!(
+                    "Failed to fetch dynamically imported module {}: blob URL not found",
+                    url
+                ))),
+            });
+        }
+
         // Module-graph CORS and same-origin credentials are relative to the
         // owning document, not to the importing module. The importer remains
         // the HTTP referrer for a dependency; keeping these URLs distinct

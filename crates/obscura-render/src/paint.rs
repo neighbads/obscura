@@ -4817,8 +4817,15 @@ fn paint_laid_dom_scrolled(
             // control renders empty however it was filled in — from markup,
             // from script, or by typing — while its `value` reads back
             // correctly, so only a screenshot or PDF shows anything wrong.
-            // `<textarea>` is unaffected: its value *is* a text node.
-            if has_value && name.local.as_ref() == "input" {
+            // A `<textarea>` with a live value (set via CDP input, `.value =`,
+            // or Playwright's `fill()`) is painted the same way once that
+            // value exists: `rendered_children` stops walking its light-DOM
+            // children as soon as a live value is present (see dom.rs), so
+            // this is the only paint of that text. Before any live value is
+            // set, a textarea's initial markup content is still its light-DOM
+            // children and continues to render through the normal per-child
+            // text-node walk, unaffected by this branch.
+            if has_value && (name.local.as_ref() == "input" || live_value.is_some()) {
                 if let Some(value) = value {
                     if !value.is_empty() {
                         let fsize = style.font_size.unwrap_or(16.0);

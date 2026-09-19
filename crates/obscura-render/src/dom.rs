@@ -9371,6 +9371,21 @@ pub(crate) fn rendered_children(tree: &DomTree, id: NodeId) -> Vec<NodeId> {
     let Some(node) = tree.get_node(id) else {
         return Vec::new();
     };
+    // A `<textarea>` with a live value (CDP input, `.value =`, Playwright
+    // `fill()`) is painted directly from that value (see paint.rs), not from
+    // its light-DOM children — matching a real browser, where a textarea's
+    // rendered content is never its light DOM once a value exists. Page
+    // script that also mutates those children directly (search-box
+    // suggestion widgets do this) must not make the same text paint twice
+    // alongside the live-value paint. Before any live value is set, a
+    // textarea's children still generate boxes normally below, so
+    // markup-authored default content keeps rendering (including wrapping).
+    let is_dirtied_textarea = node.as_element().is_some_and(|name| {
+        name.ns.as_ref() == "http://www.w3.org/1999/xhtml" && name.local.as_ref() == "textarea"
+    }) && tree.form_control_state(id).and_then(|control| control.value).is_some();
+    if is_dirtied_textarea {
+        return Vec::new();
+    }
     let is_closed_html_details = node.as_element().is_some_and(|name| {
         name.ns.as_ref() == "http://www.w3.org/1999/xhtml"
             && name.local.as_ref() == "details"
@@ -21256,6 +21271,39 @@ mod tests {
             ic_rect.height > 14.0,
             "grid row must size from the control's intrinsic height, not collapse to padding only: {:?}",
             ic_rect
+        );
+    }
+
+    /// R-01 (Bing search box renders typed text doubled): once a `<textarea>`
+    /// has a live value (CDP input, `.value =`, Playwright `fill()`), its
+    /// rendered content is that live value, not its light-DOM children —
+    /// `rendered_children` must stop walking them so `paint.rs`'s live-value
+    /// draw is the only paint of that text. Bing's own page script also
+    /// appends a text node directly into `#sb_form_q` (its suggestion-box
+    /// logic keeps a mirror child in sync); without this, that child and the
+    /// live-value paint both rendered the same text, doubling it on screen.
+    /// Before any live value is set, the light-DOM children (the markup's
+    /// default text) must still be walked normally.
+    #[test]
+    fn dirtied_textarea_value_stops_rendering_light_dom_children() {
+        let tree = parse_html(r#"<textarea id="q">seed</textarea>"#);
+        let q = tree.get_element_by_id("q").unwrap();
+
+        // Before any live value: markup-authored default content still
+        // renders through the ordinary child walk.
+        assert_eq!(rendered_children(&tree, q), tree.children(q));
+        assert!(!rendered_children(&tree, q).is_empty());
+
+        // After a live value is set (as CDP `Input.insertText` / Playwright
+        // `fill()` does), the light-DOM children — however many a page's own
+        // script has appended — must not also be painted.
+        tree.update_form_control_state(q, |control| {
+            control.value = Some("typed value".to_string())
+        });
+        assert!(
+            rendered_children(&tree, q).is_empty(),
+            "a dirtied textarea's light-DOM children must not generate boxes \
+             alongside its live-value paint"
         );
     }
 }

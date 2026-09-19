@@ -10275,7 +10275,15 @@ globalThis.KeyboardEvent = class extends Event {
 globalThis.FocusEvent = class extends Event { constructor(t,o={}) { super(t,o);this.relatedTarget=o.relatedTarget||null; } };
 globalThis.InputEvent = class extends Event { constructor(t,o={}) { super(t,o);this.data=o.data||null;this.inputType=o.inputType||""; } };
 globalThis.ErrorEvent = class extends Event { constructor(t,o={}) { super(t,o);this.message=o.message||"";this.error=o.error||null; } };
-globalThis.PointerEvent = class extends Event { constructor(t,o={}) { super(t,o); } };
+// PointerEvent interface (W3C Pointer Events, https://www.w3.org/TR/pointerevents/#pointerevent-interface)
+// extends MouseEvent and adds pointer-specific attributes. It must inherit
+// MouseEvent's clientX/clientY/button/buttons/ctrlKey/etc. so that a
+// synthesized 'pointerdown'/'pointerup' carries the same coordinates and
+// modifier state real browsers give it; extending bare Event (as before)
+// silently dropped every field a Pointer-Events-based UI library reads.
+globalThis.PointerEvent = class extends MouseEvent {
+  constructor(t,o={}) { super(t,o);this.pointerId=o.pointerId||0;this.width=o.width||1;this.height=o.height||1;this.pressure=o.pressure||0;this.tangentialPressure=o.tangentialPressure||0;this.tiltX=o.tiltX||0;this.tiltY=o.tiltY||0;this.twist=o.twist||0;this.pointerType=o.pointerType||"";this.isPrimary=!!o.isPrimary; }
+};
 globalThis.AnimationEvent = class extends Event {};
 globalThis.TransitionEvent = class extends Event {};
 globalThis.UIEvent = class extends Event {

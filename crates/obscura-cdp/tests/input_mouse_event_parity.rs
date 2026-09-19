@@ -324,6 +324,71 @@ async fn press_release_orders_events_and_defers_click_activation() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn press_release_dispatches_pointer_events_before_their_mouse_event_counterparts() {
+    // Per the W3C Pointer Events spec (https://www.w3.org/TR/pointerevents/#mapping-for-devices-that-support-hover),
+    // a pointerdown MUST be dispatched before the corresponding mousedown, and a pointerup
+    // before the corresponding mouseup, for a hover-capable pointer such as a mouse. UI
+    // libraries built on Pointer Events (e.g. React Aria's usePress) rely on this ordering
+    // to register presses; CDP-driven input must reproduce it, not just the legacy MouseEvents.
+    let (mut ctx, sid) = setup().await;
+    evaluate(
+        &mut ctx,
+        2,
+        r#"(() => {
+            const target = document.getElementById('check');
+            document.elementFromPoint = () => target;
+            globalThis.eventLog = [];
+            for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
+                target.addEventListener(type, event => eventLog.push({
+                    type, pointerType: event.pointerType, isPrimary: event.isPrimary
+                }));
+            }
+        })()"#,
+        &sid,
+    )
+    .await;
+
+    cdp(
+        &mut ctx,
+        3,
+        "Input.dispatchMouseEvent",
+        json!({
+            "type": "mousePressed", "x": 31.0, "y": 42.0,
+            "button": "left", "clickCount": 1
+        }),
+        &sid,
+    )
+    .await;
+    cdp(
+        &mut ctx,
+        4,
+        "Input.dispatchMouseEvent",
+        json!({
+            "type": "mouseReleased", "x": 31.0, "y": 42.0,
+            "button": "left", "clickCount": 1
+        }),
+        &sid,
+    )
+    .await;
+
+    let log = evaluate(&mut ctx, 5, "JSON.stringify(eventLog)", &sid).await;
+    let log: Value = serde_json::from_str(log["result"]["value"].as_str().unwrap()).unwrap();
+    let types: Vec<&str> = log
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["type"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        types,
+        ["pointerdown", "mousedown", "pointerup", "mouseup", "click"],
+        "pointerdown/pointerup must precede their mousedown/mouseup counterparts: {types:?}"
+    );
+    assert_eq!(log[0]["pointerType"], "mouse");
+    assert_eq!(log[0]["isPrimary"], true);
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn radio_release_selects_only_the_target_in_its_group() {
     let (mut ctx, sid) = setup().await;
     evaluate(

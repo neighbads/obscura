@@ -446,6 +446,54 @@ mod tests {
         assert!(frame.is_same_origin_as("https://child.example"));
     }
 
+    /// `attachShadow` inside a frame must build the root in the frame's own
+    /// document. Routing it to the page's document put the root on whichever
+    /// page node happened to share the frame node's id, so the frame's next
+    /// `shadowRoot.appendChild` looked up a parent that does not exist in its
+    /// tree and threw HierarchyRequestError.
+    #[test]
+    fn frame_attaches_shadow_roots_to_its_own_document() {
+        let mut parent = page(
+            "https://parent.example/page",
+            "<html><body><div id='a'></div><div id='b'></div></body></html>",
+        );
+        let frame = FrameRealm::new(
+            &mut parent,
+            1,
+            0,
+            "https://child.example/frame",
+            "<html><body><div id='host'></div></body></html>",
+        )
+        .expect("frame realm");
+
+        let result = frame
+            .evaluate(
+                &mut parent,
+                r#"(() => {
+                    const host = document.getElementById('host');
+                    const root = host.attachShadow({ mode: 'open' });
+                    const style = document.createElement('style');
+                    root.appendChild(style);
+                    return [
+                        root === host.shadowRoot,
+                        root.childNodes.length,
+                        root.firstChild.tagName,
+                        style.parentNode === root,
+                    ];
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!([true, 1, "STYLE", true]));
+
+        // The page's own document must not have grown a shadow root.
+        assert_eq!(
+            parent
+                .evaluate("[...document.querySelectorAll('*')].some(el => el.shadowRoot)")
+                .unwrap(),
+            serde_json::json!(false)
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn frame_uses_its_embedding_viewport() {
         let mut parent = page(

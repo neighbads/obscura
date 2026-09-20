@@ -1172,7 +1172,7 @@ async fn do_navigate(
 
     let preload_scripts: Vec<String> = ctx.preload_scripts.iter().map(|(_, s)| s.clone()).collect();
 
-    let (frame_id, loader_id, network_events, page_url, page_id, reached_network_idle) = {
+    let (frame_id, loader_id, network_events, page_url, page_id, reached_network_idle, nav_error) = {
         let page = ctx
             .get_session_page_mut(session_id)
             .ok_or("No page for session")?;
@@ -1189,15 +1189,29 @@ async fn do_navigate(
             .and_then(|v| v.as_str())
             .unwrap_or("GET");
         let nav_body = params.get("__body").and_then(|v| v.as_str()).unwrap_or("");
-        if nav_method == "POST" && !nav_body.is_empty() {
+        // `js_epoch` is bumped by `init_js`, so comparing it before/after
+        // tells us whether this navigation rebuilt the JS runtime — including
+        // the case where the runtime was rebuilt and the navigation *then*
+        // failed later (the 30s navigation deadline firing while the new
+        // document still settles, or a redirect chain past the cap).
+        // Returning Err straight away skipped the event emission below, so
+        // the client kept object handles — Playwright's cached utilityScript
+        // among them — into an execution context that no longer exists, and
+        // every later evaluate died with `utilityScript.evaluate is not a
+        // function`. Emit the events first, surface the error after, the same
+        // way emit_post_eval_nav and the click path do.
+        let epoch_before = page.js_epoch();
+        let nav_result = if nav_method == "POST" && !nav_body.is_empty() {
             page.navigate_with_wait_post(url, wait_until, nav_method, nav_body)
                 .await
-                .map_err(|e| e.to_string())?;
         } else {
-            page.navigate_with_wait(url, wait_until)
-                .await
-                .map_err(|e| e.to_string())?;
-        }
+            page.navigate_with_wait(url, wait_until).await
+        };
+        let nav_error = match nav_result {
+            Ok(()) => None,
+            Err(e) if page.js_epoch() != epoch_before => Some(e.to_string()),
+            Err(e) => return Err(e.to_string()),
+        };
 
         let reached_network_idle = page.lifecycle.is_network_idle();
         // Fold in script-initiated requests (fetch/XHR/dynamic resource) so they
@@ -1213,6 +1227,7 @@ async fn do_navigate(
             page_url,
             page_id,
             reached_network_idle,
+            nav_error,
         )
     };
 
@@ -1228,10 +1243,18 @@ async fn do_navigate(
         reached_network_idle,
     );
 
-    Ok(json!({
-        "frameId": frame_id,
-        "loaderId": loader_id,
-    }))
+    match nav_error {
+        // The context-invalidation events above are emitted first, so the
+        // client's stale handles are already dropped by the time it sees this
+        // command fail — only then do we surface the navigation error itself,
+        // matching the pre-existing contract that a failed navigation fails
+        // the triggering CDP command.
+        Some(e) => Err(e),
+        None => Ok(json!({
+            "frameId": frame_id,
+            "loaderId": loader_id,
+        })),
+    }
 }
 
 pub async fn handle(

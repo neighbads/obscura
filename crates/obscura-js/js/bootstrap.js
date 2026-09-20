@@ -14480,11 +14480,11 @@ URL.createObjectURL = function(blob) {
       // import(blob:...) / <script type=module src=blob:...>) runs outside
       // JS and can only see a blob's content through this op, not through
       // globalThis.__blobStore.
-      try { Deno.core.ops.op_blob_store_set(id, text); } catch (e) {}
+      __obscuraCore.ops.op_blob_store_set(id, text);
     } else if (typeof blob.text === 'function') {
       blob.text().then(text => {
         globalThis.__blobStore[id] = text;
-        try { Deno.core.ops.op_blob_store_set(id, text); } catch (e) {}
+        __obscuraCore.ops.op_blob_store_set(id, text);
       });
     } else {
       globalThis.__blobStore[id] = '';
@@ -14494,7 +14494,7 @@ URL.createObjectURL = function(blob) {
 };
 URL.revokeObjectURL = function(url) {
   delete globalThis.__blobStore[url];
-  try { Deno.core.ops.op_blob_store_delete(url); } catch (e) {}
+  __obscuraCore.ops.op_blob_store_delete(url);
 };
 
 // Window-level scrolling (issue #468). #431 gave elements functional

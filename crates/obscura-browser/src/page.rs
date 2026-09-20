@@ -260,6 +260,9 @@ pub struct Page {
     /// DevTools override for the compositor's base surface. It is page-owned,
     /// so it survives document navigation without leaking to other targets.
     default_background_color_override: Option<[u8; 4]>,
+    /// DevTools override for `navigator.languages`. Like the other emulation
+    /// overrides it is page-owned and survives document navigation.
+    navigator_languages: Option<Vec<String>>,
     /// WHATWG canonical name of the current document's character encoding
     /// (e.g. "UTF-8", "EUC-JP"), detected when the response body is decoded.
     /// Exposed to JS as `document.characterSet` and used for the URL query
@@ -1107,6 +1110,7 @@ impl Page {
             device_metrics_baseline: None,
             device_scale_factor: 1.0,
             default_background_color_override: None,
+            navigator_languages: None,
             encoding: "UTF-8".to_string(),
             document_timeline_origin: std::time::Instant::now(),
             navigation_timeout: None,
@@ -1713,6 +1717,15 @@ impl Page {
         self.default_background_color_override = color;
     }
 
+    /// Set or clear the `navigator.languages` override. `None` restores the
+    /// engine default list.
+    pub fn set_navigator_languages(&mut self, languages: Option<Vec<String>>) {
+        self.navigator_languages = languages.filter(|languages| !languages.is_empty());
+        if let Some(js) = &mut self.js {
+            js.set_languages(self.navigator_languages.as_deref());
+        }
+    }
+
     #[cfg(feature = "render")]
     fn capture_surface_color(&self) -> [u8; 4] {
         self.default_background_color_override
@@ -1801,6 +1814,9 @@ impl Page {
         }
         if let Some((lat, lon)) = env_geolocation() {
             rt.set_geolocation(lat, lon);
+        }
+        if self.navigator_languages.is_some() {
+            rt.set_languages(self.navigator_languages.as_deref());
         }
         rt.set_viewport(self.viewport.0 as f64, self.viewport.1 as f64);
         rt.set_screen_size_override(

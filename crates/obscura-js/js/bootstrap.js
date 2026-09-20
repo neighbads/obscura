@@ -21,6 +21,7 @@ const __obscuraCore = globalThis.Deno.core;
     '__obscura_errors', '__obscura_init', '__obscura_hide_list',
     '__obscura_objects', '__obscura_oid', '__obscura_ua',
     '__obscura_platform', '__obscura_ua_platform', '__obscura_ua_platform_version',
+    '__obscura_languages',
     '__obscura_stealth', '__obscura_markTrusted', '__obscura_core_handoff',
     '__obscura_frameId', '__obscura_parentFrameId', '__obscura_frameWindows',
     '__obscura_frameObjects', '__obscura_frameElements', '__obscura_deliverMessage',
@@ -7214,8 +7215,17 @@ globalThis.navigator = {
   defGetter('platform', function() {
     return globalThis.__obscura_platform || "Win32";
   });
-  defGetter('language', function() { return "en-US"; });
-  defGetter('languages', function() { return ["en-US", "en"]; });
+  // navigator.language is the first entry of navigator.languages (Blink:
+  // NavigatorLanguage::language() returns languages().front()). The list is
+  // overridable through Emulation.setUserAgentOverride's acceptLanguage.
+  defGetter('language', function() {
+    var langs = globalThis.__obscura_languages;
+    return (langs && langs.length) ? langs[0] : "en-US";
+  });
+  defGetter('languages', function() {
+    var langs = globalThis.__obscura_languages;
+    return (langs && langs.length) ? langs.slice() : ["en-US", "en"];
+  });
 
   // Cache plugins/mimeTypes so navigator.plugins === navigator.plugins.
   var _plugins = new PluginArray([

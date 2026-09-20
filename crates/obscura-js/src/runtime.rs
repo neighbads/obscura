@@ -895,11 +895,12 @@ impl ObscuraJsRuntime {
     ) {
         use deno_core::v8;
 
-        const IDENTITY_GLOBALS: [&str; 7] = [
+        const IDENTITY_GLOBALS: [&str; 8] = [
             "__obscura_ua",
             "__obscura_platform",
             "__obscura_ua_platform",
             "__obscura_ua_platform_version",
+            "__obscura_languages",
             "__obscura_stealth",
             "__obscura_geo_lat",
             "__obscura_geo_lon",
@@ -1435,6 +1436,27 @@ impl ObscuraJsRuntime {
                 js_string_literal(ua_platform),
                 js_string_literal(ua_platform_version),
             ),
+        );
+    }
+
+    /// Override the language list `navigator.languages` reports, with
+    /// `navigator.language` following as its first entry. `None` restores the
+    /// bootstrap default.
+    pub fn set_languages(&mut self, languages: Option<&[String]>) {
+        let value = match languages {
+            Some(languages) if !languages.is_empty() => format!(
+                "[{}]",
+                languages
+                    .iter()
+                    .map(|language| js_string_literal(language))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ),
+            _ => "undefined".to_string(),
+        };
+        let _ = self.execute_runtime_script(
+            "<set-languages>",
+            format!("globalThis.__obscura_languages = {};", value),
         );
     }
 

@@ -58,6 +58,25 @@ fn default_background_color(params: &Value) -> Result<Option<[u8; 4]>, String> {
     ]))
 }
 
+/// Split an `acceptLanguage` override into the list `navigator.languages`
+/// reports, mirroring Blink's `ParseAndSanitize` (navigator_language.cc): split
+/// on commas, drop empty entries, trim each token and normalise an `xx_YY`
+/// separator. Quality values are deliberately kept, as Blink keeps them too.
+fn parse_accept_language(accept_language: &str) -> Vec<String> {
+    accept_language
+        .split(',')
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .map(|token| {
+            if token.len() >= 3 && token.as_bytes()[2] == b'_' {
+                format!("{}-{}", &token[..2], &token[3..])
+            } else {
+                token.to_string()
+            }
+        })
+        .collect()
+}
+
 pub async fn handle(
     method: &str,
     params: &Value,
@@ -121,6 +140,23 @@ pub async fn handle(
             page.set_default_background_color_override(color);
             Ok(json!({}))
         }
+        // Only the acceptLanguage part is honoured: it drives
+        // navigator.languages, and navigator.language as its first entry, the
+        // way Blink feeds the override into NavigatorLanguage. An absent or
+        // empty value clears the override. The user agent itself is overridden
+        // through Network.setUserAgentOverride.
+        "setUserAgentOverride" => {
+            let languages = params
+                .get("acceptLanguage")
+                .and_then(Value::as_str)
+                .map(parse_accept_language)
+                .filter(|languages| !languages.is_empty());
+            let page = ctx
+                .get_session_page_mut(session_id)
+                .ok_or("No page for session")?;
+            page.set_navigator_languages(languages);
+            Ok(json!({}))
+        }
         // Touch emulation does not affect layout yet, but acknowledging it is
         // compatible with clients that pair it with a metrics override.
         "setTouchEmulationEnabled" => Ok(json!({})),
@@ -131,6 +167,87 @@ pub async fn handle(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const READ_LANGUAGES: &str = "return [navigator.language, navigator.languages];";
+
+    #[tokio::test]
+    async fn accept_language_override_drives_navigator_languages() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session_id = Some("language-session".to_string());
+        ctx.sessions.insert(session_id.clone().unwrap(), page_id);
+
+        let page = ctx.get_session_page_mut(&session_id).unwrap();
+        assert_eq!(
+            page.evaluate(READ_LANGUAGES),
+            json!(["en-US", ["en-US", "en"]]),
+            "no override must keep the engine default"
+        );
+
+        handle(
+            "setUserAgentOverride",
+            &json!({"userAgent": "", "acceptLanguage": "zh-CN,zh;q=0.9"}),
+            &mut ctx,
+            &session_id,
+        )
+        .await
+        .expect("accept language override");
+
+        let page = ctx.get_session_page_mut(&session_id).unwrap();
+        assert_eq!(
+            page.evaluate(READ_LANGUAGES),
+            json!(["zh-CN", ["zh-CN", "zh;q=0.9"]])
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_accept_language_restores_default_languages() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session_id = Some("language-clear-session".to_string());
+        ctx.sessions.insert(session_id.clone().unwrap(), page_id);
+
+        for accept_language in ["zh-CN", ""] {
+            handle(
+                "setUserAgentOverride",
+                &json!({"userAgent": "", "acceptLanguage": accept_language}),
+                &mut ctx,
+                &session_id,
+            )
+            .await
+            .expect("accept language override");
+        }
+
+        let page = ctx.get_session_page_mut(&session_id).unwrap();
+        assert_eq!(
+            page.evaluate(READ_LANGUAGES),
+            json!(["en-US", ["en-US", "en"]])
+        );
+    }
+
+    #[tokio::test]
+    async fn navigator_languages_override_survives_navigation() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session_id = Some("language-nav-session".to_string());
+        ctx.sessions.insert(session_id.clone().unwrap(), page_id);
+
+        handle(
+            "setUserAgentOverride",
+            &json!({"userAgent": "", "acceptLanguage": "de-DE"}),
+            &mut ctx,
+            &session_id,
+        )
+        .await
+        .expect("accept language override");
+
+        ctx.get_session_page_mut(&session_id)
+            .unwrap()
+            .navigate_blank();
+
+        let page = ctx.get_session_page_mut(&session_id).unwrap();
+        assert_eq!(page.evaluate(READ_LANGUAGES), json!(["de-DE", ["de-DE"]]));
+    }
 
     #[tokio::test]
     async fn device_metrics_override_updates_page_and_window_viewport() {

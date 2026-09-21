@@ -601,6 +601,42 @@ mod tests {
         );
     }
 
+    /// A Canvas2D context registers its backing store against a node id. Taken
+    /// as a page node id, a frame's canvas is not a canvas at all, so the
+    /// registration failed and `getContext('2d')` answered null for every
+    /// canvas inside a frame.
+    #[test]
+    fn frame_registers_canvas_surfaces_in_its_own_document() {
+        let mut parent = page(
+            "https://parent.example/page",
+            "<html><body><div id='p'></div><div id='q'></div></body></html>",
+        );
+        let frame = FrameRealm::new(
+            &mut parent,
+            1,
+            0,
+            "https://child.example/frame",
+            "<html><body><canvas id='c' width='20' height='20'></canvas></body></html>",
+        )
+        .expect("frame realm");
+
+        assert_eq!(
+            frame
+                .evaluate(
+                    &mut parent,
+                    r#"(() => {
+                        const context = document.getElementById('c').getContext('2d');
+                        context.fillStyle = 'rgb(9,8,7)';
+                        context.fillRect(0, 0, 2, 2);
+                        const pixel = context.getImageData(0, 0, 1, 1).data;
+                        return [context !== null, pixel[0], pixel[1], pixel[2]];
+                    })()"#,
+                )
+                .unwrap(),
+            serde_json::json!([true, 9, 8, 7])
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn frame_uses_its_embedding_viewport() {
         let mut parent = page(

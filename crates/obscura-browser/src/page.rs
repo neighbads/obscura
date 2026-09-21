@@ -2615,6 +2615,20 @@ impl Page {
             |page: &mut Self,
              script: &ScriptInfo,
              fetched_script: Option<(String, String, obscura_net::Response)>| {
+                // HTML: an external classic script fires `load` at its element
+                // once it has executed, and `error` when the fetch failed. An
+                // exception thrown by the script itself does not change that.
+                let fire_script_event = |page: &mut Self, ok: bool| {
+                    if let Some(js) = &mut page.js {
+                        let _ = js.execute_script(
+                            "<script-resource-event>",
+                            &format!(
+                                "globalThis.__obscura_fireScriptResourceEvent({}, {ok});",
+                                script.nid
+                            ),
+                        );
+                    }
+                };
                 if script.src.is_some() {
                     if let Some((url, code, resp)) = fetched_script {
                         tracing::info!("Executing script ({} bytes): {}", code.len(), url);
@@ -2641,6 +2655,9 @@ impl Page {
                                 "globalThis.__currentScriptNid=0;",
                             );
                         }
+                        fire_script_event(page, true);
+                    } else {
+                        fire_script_event(page, false);
                     }
                 } else if !script.inline.is_empty() {
                     if let Some(js) = &mut page.js {
@@ -2945,6 +2962,14 @@ impl Page {
                 "<dom-content-loaded>",
                 "try { document.dispatchEvent(new Event('DOMContentLoaded', {bubbles:false,cancelable:false})); } catch(e) {}\n\
                  try { window.dispatchEvent(new Event('DOMContentLoaded', {bubbles:false,cancelable:false})); } catch(e) {}",
+            );
+
+            // Parser images finish after DOMContentLoaded and before the load
+            // event, which is also where a browser reports them. The pump
+            // below gives the ones still in flight their chance to settle.
+            let _ = js.execute_script(
+                "<parser-image-events>",
+                "try { globalThis.__obscura_fireParserImageEvents(); } catch(e) {}",
             );
 
             let load_blockers_finished =
@@ -7048,6 +7073,157 @@ mod tests {
                 .unwrap(),
             serde_json::json!(1.0),
             "window.onload must fire exactly once",
+        );
+    }
+
+    /// Serves `/ok.js` and `/ok.png`; anything else answers 404.
+    fn spawn_resource_event_server() -> String {
+        use std::io::{Read as _, Write as _};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let png = base64::engine::general_purpose::STANDARD
+            .decode(
+                "iVBORw0KGgoAAAANSUhEUgAAAAIAAAADCAYAAAC56t6B\
+                 AAAAFklEQVR4nGP8z8Dwn4GBgYGJAQrgDAAxOwIE7x6DkQAAAABJRU5ErkJggg==",
+            )
+            .unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else {
+                    continue;
+                };
+                let png = png.clone();
+                std::thread::spawn(move || {
+                    let mut request = [0u8; 2048];
+                    let length = stream.read(&mut request).unwrap_or(0);
+                    let request = String::from_utf8_lossy(&request[..length]);
+                    let path = request
+                        .lines()
+                        .next()
+                        .and_then(|line| line.split_ascii_whitespace().nth(1))
+                        .unwrap_or("/")
+                        .to_string();
+                    match path.as_str() {
+                        "/ok.js" => {
+                            let body = "globalThis.__externalRan = true;";
+                            let _ = stream.write_all(
+                                format!(
+                                    "HTTP/1.1 200 OK\r\nContent-Type: application/javascript\r\n\
+                                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                    body.len(),
+                                )
+                                .as_bytes(),
+                            );
+                        }
+                        "/ok.png" => {
+                            let _ = stream.write_all(
+                                format!(
+                                    "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\n\
+                                     Content-Length: {}\r\nConnection: close\r\n\r\n",
+                                    png.len(),
+                                )
+                                .as_bytes(),
+                            );
+                            let _ = stream.write_all(&png);
+                        }
+                        _ => {
+                            let _ = stream.write_all(
+                                b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\
+                                  Connection: close\r\n\r\n",
+                            );
+                        }
+                    }
+                });
+            }
+        });
+        format!("http://{address}")
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn parser_external_scripts_fire_load_and_error() {
+        let base = spawn_resource_event_server();
+        let html = format!(
+            r#"<html><head><script>
+                globalThis.__log = [];
+                document.addEventListener('load',
+                    event => globalThis.__log.push('capture-load:' + event.target.id), true);
+                document.addEventListener('error',
+                    event => globalThis.__log.push('capture-error:' + event.target.id), true);
+            </script>
+            <script id="ok" src="{base}/ok.js"
+                onload="globalThis.__log.push('attr-load')"></script>
+            <script id="bad" src="{base}/missing.js"
+                onerror="globalThis.__log.push('attr-error')"></script>
+            <script>globalThis.__log.push('later-inline');</script>
+            </head><body></body></html>"#
+        );
+        let mut page = import_map_test_page("script-resource-events", "http://127.0.0.1:9", &html);
+
+        page.execute_scripts().await;
+
+        assert_eq!(
+            page.js.as_mut().unwrap().evaluate("globalThis.__log").unwrap(),
+            serde_json::json!([
+                "capture-load:ok",
+                "attr-load",
+                "capture-error:bad",
+                "attr-error",
+                "later-inline",
+            ]),
+            "an external classic script announces its outcome at its own \
+             position in the script order",
+        );
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn parser_images_fire_load_and_error() {
+        let base = spawn_resource_event_server();
+        let html = format!(
+            r#"<html><head><script>
+                globalThis.__log = [];
+                document.addEventListener('load',
+                    event => globalThis.__log.push('load:' + event.target.id), true);
+                document.addEventListener('error',
+                    event => globalThis.__log.push('error:' + event.target.id), true);
+            </script></head><body>
+            <img id="ok" src="{base}/ok.png"><img id="bad" src="{base}/bad.png">
+            </body></html>"#
+        );
+        let mut page = import_map_test_page("image-resource-events", "http://127.0.0.1:9", &html);
+
+        page.execute_scripts().await;
+
+        // No script ever touches these elements, so only the document-wide
+        // capture listener can observe them. Their requests settle on the
+        // event loop.
+        let settled = page
+            .js
+            .as_mut()
+            .unwrap()
+            .evaluate_for_cdp(
+                r#"new Promise(resolve => {
+                    const deadline = Date.now() + 5000;
+                    const poll = () => {
+                        if (globalThis.__log.length >= 2 || Date.now() > deadline) {
+                            resolve(globalThis.__log.slice().sort());
+                            return;
+                        }
+                        setTimeout(poll, 20);
+                    };
+                    poll();
+                })"#,
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            settled.value.unwrap(),
+            serde_json::json!(["error:bad", "load:ok"]),
+            "a parser image no script ever touches still announces its outcome",
         );
     }
 

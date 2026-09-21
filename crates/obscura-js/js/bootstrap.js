@@ -33,7 +33,8 @@ const __obscuraCore = globalThis.Deno.core;
     '__obscura_nextPendingTimeoutDelay',
     '__obscura_hw', '__obscura_mem',
     '__documentReadyState__', '__obscura_setDocumentReadyState',
-    '__obscura_fireWindowLoad', '__currentUrl',
+    '__obscura_fireWindowLoad', '__obscura_fireScriptResourceEvent',
+    '__obscura_fireParserImageEvents', '__currentUrl',
     // internal helpers (var-declared throughout the file)
     '__processDynScriptQueue', '_decodeDataScriptUrl', '_markNative', '_fpRand', '_fpNoise',
     '_fpCache', '_getFp', '_fp', '_splitAsciiWhitespace',
@@ -139,6 +140,40 @@ globalThis.dispatchEvent = function(event) {
   event.currentTarget = null;
   event.eventPhase = 0;
   return !event.defaultPrevented;
+};
+
+// HTML, executing a script element: after an external classic script runs,
+// fire `load` at the element; when its fetch fails, fire `error` instead.
+// Inline scripts fire neither. The host owns parser script execution, so it
+// reports the outcome here.
+globalThis.__obscura_fireScriptResourceEvent = function(nid, ok) {
+  const element = _wrapEl(+nid);
+  if (!element) return;
+  try {
+    element.dispatchEvent(new Event(ok ? 'load' : 'error'));
+  } catch (e) { console.error(e); }
+};
+
+// Parser-inserted images are fetched by the host before page script runs, so
+// their wrappers can adopt an already-settled request and never announce it.
+// Report the outcome once per element, and let the ordinary request path
+// handle the ones still in flight.
+globalThis.__obscura_fireParserImageEvents = function() {
+  let images;
+  try { images = document.querySelectorAll('img'); } catch (e) { return; }
+  for (const image of images) {
+    if (image._imageEventFired) continue;
+    if (typeof image._queueImageRequest !== 'function') continue;
+    if (!image.getAttribute('src') && !image.getAttribute('srcset')) continue;
+    if (image._imageComplete) {
+      image._imageEventFired = true;
+      try {
+        image.dispatchEvent(new Event(image._imageDecoded ? 'load' : 'error'));
+      } catch (e) { console.error(e); }
+    } else {
+      image._queueImageRequest();
+    }
+  }
 };
 
 // HTML "the end" step 7: fire an event named `load` at the Window with the
@@ -6634,6 +6669,7 @@ class HTMLImageElement extends HTMLElement {
       this._imageNaturalHeight = Number.isFinite(height) && height > 0 ? Math.round(height) : 0;
       this._resolveImageDecodes(request);
       if (dispatchEvent) {
+        this._imageEventFired = true;
         try { this.dispatchEvent(new Event("load")); } catch (_error) {}
       }
     } else {
@@ -6642,6 +6678,7 @@ class HTMLImageElement extends HTMLElement {
       this._imageNaturalHeight = 0;
       this._rejectImageDecodes(request);
       if (dispatchEvent) {
+        this._imageEventFired = true;
         try { this.dispatchEvent(new Event("error")); } catch (_error) {}
       }
     }

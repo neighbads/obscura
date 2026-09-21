@@ -7026,8 +7026,8 @@ fn clamp_scroll_offset_for_consumer(
 #[cfg(feature = "render")]
 #[op2]
 #[string]
-fn op_layout_geometry(state: &OpState, #[string] nid_str: String) -> String {
-    let shared = state.borrow::<SharedState>().clone();
+fn op_layout_geometry(state: &OpState, #[string] nid_str: String, frame_id: u32) -> String {
+    let shared = frame_state(state, frame_id);
     let nid: u32 = nid_str.parse().unwrap_or(0);
     let nid = obscura_dom::tree::NodeId::new(nid);
     let mut gs = shared.borrow_mut();
@@ -7088,13 +7088,17 @@ fn op_layout_geometry(state: &OpState, #[string] nid_str: String) -> String {
 #[cfg(feature = "render")]
 #[op2]
 #[string]
-fn op_resize_observer_measurements(state: &OpState, #[string] nids_json: String) -> String {
+fn op_resize_observer_measurements(
+    state: &OpState,
+    #[string] nids_json: String,
+    frame_id: u32,
+) -> String {
     let nids = serde_json::from_str::<Vec<u32>>(&nids_json).unwrap_or_default();
     if nids.is_empty() {
         return "[]".to_string();
     }
 
-    let shared = state.borrow::<SharedState>().clone();
+    let shared = frame_state(state, frame_id);
     let mut gs = shared.borrow_mut();
     sample_live_document_animations(&mut gs);
     if ensure_resolved_scroll_for_geometry(&mut gs).is_none() {
@@ -7156,13 +7160,14 @@ fn op_resize_observer_measurements(state: &OpState, #[string] nids_json: String)
 fn op_intersection_observer_measurements(
     state: &OpState,
     #[string] nids_json: String,
+    frame_id: u32,
 ) -> String {
     let nids = serde_json::from_str::<Vec<u32>>(&nids_json).unwrap_or_default();
     if nids.is_empty() {
         return "[]".to_string();
     }
 
-    let shared = state.borrow::<SharedState>().clone();
+    let shared = frame_state(state, frame_id);
     let mut gs = shared.borrow_mut();
     sample_live_document_animations(&mut gs);
     if ensure_resolved_scroll_for_geometry(&mut gs).is_none() {
@@ -7212,8 +7217,8 @@ fn op_intersection_observer_measurements(
 #[cfg(feature = "render")]
 #[op2]
 #[string]
-fn op_computed_style(state: &OpState, #[string] nid_str: String) -> String {
-    let shared = state.borrow::<SharedState>().clone();
+fn op_computed_style(state: &OpState, #[string] nid_str: String, frame_id: u32) -> String {
+    let shared = frame_state(state, frame_id);
     let nid: u32 = nid_str.parse().unwrap_or(0);
     let nid = obscura_dom::tree::NodeId::new(nid);
     let mut gs = shared.borrow_mut();
@@ -7267,8 +7272,8 @@ fn op_layout_metrics(state: &OpState) -> String {
 #[cfg(feature = "render")]
 #[op2]
 #[string]
-fn op_element_scroll_metrics(state: &OpState, #[string] nid_str: String) -> String {
-    let shared = state.borrow::<SharedState>().clone();
+fn op_element_scroll_metrics(state: &OpState, #[string] nid_str: String, frame_id: u32) -> String {
+    let shared = frame_state(state, frame_id);
     let nid = NodeId::new(nid_str.parse().unwrap_or(0));
     let mut gs = shared.borrow_mut();
     sample_live_document_animations(&mut gs);
@@ -7304,8 +7309,14 @@ fn op_element_scroll_metrics(state: &OpState, #[string] nid_str: String) -> Stri
 #[cfg(feature = "render")]
 #[op2]
 #[string]
-fn op_element_scroll_to(state: &OpState, #[string] nid_str: String, x: f64, y: f64) -> String {
-    let shared = state.borrow::<SharedState>().clone();
+fn op_element_scroll_to(
+    state: &OpState,
+    #[string] nid_str: String,
+    x: f64,
+    y: f64,
+    frame_id: u32,
+) -> String {
+    let shared = frame_state(state, frame_id);
     let nid = NodeId::new(nid_str.parse().unwrap_or(0));
     let mut gs = shared.borrow_mut();
     sample_live_document_animations(&mut gs);

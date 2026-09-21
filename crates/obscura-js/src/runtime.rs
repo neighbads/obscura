@@ -12269,10 +12269,10 @@ mod tests {
                 const nativeBulk = __obscura_test_ops.op_resize_observer_measurements;
                 const nativeGeometry = __obscura_test_ops.op_layout_geometry;
                 const nativeComputedStyle = __obscura_test_ops.op_computed_style;
-                __obscura_test_ops.op_resize_observer_measurements = input => {
+                __obscura_test_ops.op_resize_observer_measurements = (...args) => {
                     __resizeBulkCalls++;
-                    __resizeBulkSizes.push(JSON.parse(input).length);
-                    return nativeBulk(input);
+                    __resizeBulkSizes.push(JSON.parse(args[0]).length);
+                    return nativeBulk(...args);
                 };
                 __obscura_test_ops.op_layout_geometry = (...args) => {
                     __resizeLegacyGeometryCalls++;
@@ -12636,10 +12636,10 @@ mod tests {
                 const nativeBulk = __obscura_test_ops.op_intersection_observer_measurements;
                 const nativeGeometry = __obscura_test_ops.op_layout_geometry;
                 const nativeComputedStyle = __obscura_test_ops.op_computed_style;
-                __obscura_test_ops.op_intersection_observer_measurements = input => {
+                __obscura_test_ops.op_intersection_observer_measurements = (...args) => {
                     __intersectionBulkCalls++;
-                    __intersectionBulkSizes.push(JSON.parse(input).length);
-                    return nativeBulk(input);
+                    __intersectionBulkSizes.push(JSON.parse(args[0]).length);
+                    return nativeBulk(...args);
                 };
                 __obscura_test_ops.op_layout_geometry = (...args) => {
                     __intersectionLegacyGeometryCalls++;

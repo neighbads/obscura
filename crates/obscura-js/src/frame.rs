@@ -494,6 +494,113 @@ mod tests {
         );
     }
 
+    /// CSSOM View inside a frame must measure the frame's own document. The
+    /// geometry ops took the page's document with the frame's node id, so a
+    /// frame read whichever page node happened to share that id: every rect,
+    /// client size, computed style and scroll metric described the parent.
+    #[test]
+    fn frame_measures_layout_against_its_own_document() {
+        let mut parent = page(
+            "https://parent.example/page",
+            "<html><body><div id='p' style='width:500px;height:400px'></div>\
+             <div id='q' style='width:33px;height:44px'></div></body></html>",
+        );
+        let frame = FrameRealm::new(
+            &mut parent,
+            1,
+            0,
+            "https://child.example/frame",
+            "<html><body><div id='box' style='width:120px;height:60px;background:rgb(1,2,3)'></div>\
+             <div id='sc' style='width:50px;height:50px;overflow:auto'>\
+               <div style='width:200px;height:300px'></div></div></body></html>",
+        )
+        .expect("frame realm");
+
+        let result = frame
+            .evaluate(
+                &mut parent,
+                r#"(() => {
+                    const box = document.getElementById('box');
+                    const sc = document.getElementById('sc');
+                    const rect = box.getBoundingClientRect();
+                    const style = getComputedStyle(box);
+                    sc.scrollTop = 40;
+                    return [
+                        rect.width, rect.height,
+                        style.width, style.height, style.backgroundColor,
+                        box.clientWidth, box.clientHeight,
+                        sc.scrollWidth, sc.scrollHeight, sc.scrollTop,
+                    ];
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([
+                120, 60, "120px", "60px", "rgb(1, 2, 3)", 120, 60, 200, 300, 40
+            ])
+        );
+
+        // Measuring from the frame must not have moved the page's own scroller
+        // or changed what the page measures.
+        assert_eq!(
+            parent
+                .evaluate(
+                    "(() => { const q = document.getElementById('q');\
+                       return [document.getElementById('p').getBoundingClientRect().width,\
+                               q.scrollWidth, q.scrollTop]; })()",
+                )
+                .unwrap(),
+            serde_json::json!([500, 33, 0])
+        );
+    }
+
+    /// ResizeObserver and IntersectionObserver batch their measurements through
+    /// their own ops, so they route independently of `getBoundingClientRect`.
+    /// A frame's observers reported the parent's boxes, which is what decides
+    /// whether a framed widget believes it is visible.
+    #[tokio::test(flavor = "current_thread")]
+    async fn frame_observers_measure_its_own_document() {
+        let mut parent = page(
+            "https://parent.example/page",
+            "<html><body><div id='p' style='width:500px;height:400px'></div></body></html>",
+        );
+        let frame = FrameRealm::new(
+            &mut parent,
+            1,
+            0,
+            "https://child.example/frame",
+            "<html><body><div id='box' style='width:120px;height:60px'></div></body></html>",
+        )
+        .expect("frame realm");
+
+        frame
+            .execute_script(
+                &mut parent,
+                "globalThis.resized = null;\
+                 globalThis.intersected = null;\
+                 const box = document.getElementById('box');\
+                 new ResizeObserver(entries => {\
+                   globalThis.resized = [entries[0].target.id,\
+                     entries[0].contentRect.width, entries[0].contentRect.height];\
+                 }).observe(box);\
+                 new IntersectionObserver(entries => {\
+                   globalThis.intersected = [entries[0].target.id, entries[0].isIntersecting,\
+                     entries[0].boundingClientRect.width,\
+                     entries[0].boundingClientRect.height];\
+                 }).observe(box);",
+            )
+            .unwrap();
+        parent.run_event_loop_bounded(300).await.unwrap();
+
+        assert_eq!(
+            frame
+                .evaluate(&mut parent, "[globalThis.resized, globalThis.intersected]")
+                .unwrap(),
+            serde_json::json!([["box", 120, 60], ["box", true, 120, 60]])
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn frame_uses_its_embedding_viewport() {
         let mut parent = page(

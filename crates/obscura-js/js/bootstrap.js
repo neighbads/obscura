@@ -4772,7 +4772,7 @@ class Element extends Node {
   _renderClientMetrics() {
     if (typeof __obscuraCore.ops.op_layout_geometry !== 'function') return null;
     try {
-      const raw = __obscuraCore.ops.op_layout_geometry(String(this._nid | 0));
+      const raw = __obscuraCore.ops.op_layout_geometry(String(this._nid | 0), _realmFrameId);
       if (!raw) return { width: 0, height: 0 };
       const geometry = JSON.parse(raw);
       if (geometry
@@ -4797,7 +4797,7 @@ class Element extends Node {
   _renderBoxGeometry() {
     if (typeof __obscuraCore.ops.op_layout_geometry !== 'function') return undefined;
     try {
-      const raw = __obscuraCore.ops.op_layout_geometry(String(this._nid | 0));
+      const raw = __obscuraCore.ops.op_layout_geometry(String(this._nid | 0), _realmFrameId);
       if (!raw) return null;
       const geometry = JSON.parse(raw);
       if (geometry
@@ -4866,7 +4866,7 @@ class Element extends Node {
   _renderElementScrollMetrics() {
     if (typeof __obscuraCore.ops.op_element_scroll_metrics !== 'function') return undefined;
     try {
-      const raw = __obscuraCore.ops.op_element_scroll_metrics(String(this._nid | 0));
+      const raw = __obscuraCore.ops.op_element_scroll_metrics(String(this._nid | 0), _realmFrameId);
       if (!raw) return null;
       const metrics = JSON.parse(raw);
       return metrics && metrics.hasBox !== false ? metrics : null;
@@ -4895,7 +4895,7 @@ class Element extends Node {
   _setRenderElementScroll(x, y) {
     if (typeof __obscuraCore.ops.op_element_scroll_to !== 'function') return null;
     try {
-      const raw = __obscuraCore.ops.op_element_scroll_to(String(this._nid | 0), +x || 0, +y || 0);
+      const raw = __obscuraCore.ops.op_element_scroll_to(String(this._nid | 0), +x || 0, +y || 0, _realmFrameId);
       return raw ? JSON.parse(raw) : null;
     } catch (_e) {
       return null;
@@ -8179,7 +8179,7 @@ function _roMeasurement(target, suppliedGeometry, suppliedByBatch = false) {
   const hasRenderer = typeof __obscuraCore.ops.op_layout_geometry === "function";
   if (!suppliedByBatch && hasRenderer && target?._nid != null) {
     try {
-      const raw = __obscuraCore.ops.op_layout_geometry(String(target._nid | 0));
+      const raw = __obscuraCore.ops.op_layout_geometry(String(target._nid | 0), _realmFrameId);
       geometry = raw ? JSON.parse(raw) : null;
     } catch (_error) {}
   }
@@ -8281,7 +8281,7 @@ function _roMeasurements(targets) {
   if (typeof bulk === "function"
       && targets.every(target => target?._nid != null)) {
     try {
-      const raw = bulk(JSON.stringify(targets.map(target => target._nid | 0)));
+      const raw = bulk(JSON.stringify(targets.map(target => target._nid | 0)), _realmFrameId);
       const geometries = raw ? JSON.parse(raw) : null;
       if (Array.isArray(geometries) && geometries.length === targets.length) {
         for (let index = 0; index < targets.length; index++) {
@@ -8697,7 +8697,7 @@ globalThis.getComputedStyle = (el) => {
     snapshot.rendered = null;
     if (typeof __obscuraCore.ops.op_computed_style === 'function' && el?._nid != null) {
       try {
-        const raw = __obscuraCore.ops.op_computed_style(String(el._nid | 0));
+        const raw = __obscuraCore.ops.op_computed_style(String(el._nid | 0), _realmFrameId);
         snapshot.rendered = raw ? JSON.parse(raw) : null;
       } catch (e) {}
     }
@@ -9856,7 +9856,7 @@ function _ioMeasurements(elements) {
   const nativeElements = elements.filter(element => element?._nid != null);
   if (typeof bulk !== "function" || !nativeElements.length) return measurements;
   try {
-    const raw = bulk(JSON.stringify(nativeElements.map(element => element._nid | 0)));
+    const raw = bulk(JSON.stringify(nativeElements.map(element => element._nid | 0)), _realmFrameId);
     const geometries = raw ? JSON.parse(raw) : null;
     if (Array.isArray(geometries) && geometries.length === nativeElements.length) {
       for (let index = 0; index < nativeElements.length; index++) {

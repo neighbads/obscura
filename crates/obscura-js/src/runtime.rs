@@ -4412,6 +4412,8 @@ mod tests {
                    const outer = document.getElementById('outer');
                    window.addEventListener('load', e => log.push('win-capture:' + e.eventPhase), true);
                    window.addEventListener('load', () => log.push('win-bubble'));
+                   window.addEventListener('ping', e => log.push('win-ping:' + e.eventPhase), true);
+                   document.addEventListener('ping', e => log.push('doc-ping:' + e.eventPhase), true);
                    document.addEventListener('load', e => log.push(
                        'doc-capture:' + e.eventPhase + ':' + (e.target === img)), true);
                    document.addEventListener('load', () => log.push('doc-bubble'));
@@ -4419,18 +4421,21 @@ mod tests {
                    outer.addEventListener('load', () => log.push('outer-bubble'));
                    img.addEventListener('load', e => log.push('target:' + e.eventPhase));
                    img.dispatchEvent(new Event('load'));
+                   img.dispatchEvent(new Event('ping'));
                    return log;
                  })()"
             )
             .unwrap(),
             serde_json::json!([
-                "win-capture:1",
                 "doc-capture:1:true",
                 "outer-capture:1",
                 "target:2",
+                "win-ping:1",
+                "doc-ping:1",
             ]),
             "a non-bubbling element event reaches every ancestor capture listener \
-             and no bubble listener"
+             and no bubble listener; `load` stops at the document because a \
+             Document has no event-path parent for it"
         );
     }
 

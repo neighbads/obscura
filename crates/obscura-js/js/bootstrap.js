@@ -2015,8 +2015,12 @@ function _runCapturePhase(target, event) {
   let node = target.parentNode;
   while (node) { path.push(node); node = node.parentNode; }
   // A detached subtree's path stops at its own root: neither the document nor
-  // the window is on it.
-  if (path.length && path[path.length - 1] === globalThis.document) path.push(globalThis);
+  // the window is on it. DOM "get the parent" for a Document returns null for
+  // `load` specifically, so a resource's load event never reaches the window,
+  // which has a load event of its own.
+  if (path.length && path[path.length - 1] === globalThis.document && event.type !== 'load') {
+    path.push(globalThis);
+  }
   if (!path.length) return;
   event.eventPhase = 1;
   for (let i = path.length - 1; i >= 0; i--) {

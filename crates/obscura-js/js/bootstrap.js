@@ -32,7 +32,7 @@ const __obscuraCore = globalThis.Deno.core;
     '__obscura_hasPendingLoadDelayingScripts', '__obscura_hasPendingParserBlockingScripts',
     '__obscura_nextPendingTimeoutDelay',
     '__obscura_hw', '__obscura_mem',
-    '__documentReadyState__', '__currentUrl',
+    '__documentReadyState__', '__obscura_setDocumentReadyState', '__currentUrl',
     // internal helpers (var-declared throughout the file)
     '__processDynScriptQueue', '_decodeDataScriptUrl', '_markNative', '_fpRand', '_fpNoise',
     '_fpCache', '_getFp', '_fp', '_splitAsciiWhitespace',
@@ -119,6 +119,20 @@ globalThis.dispatchEvent = function(event) {
   const handlers = globalThis.__windowListeners[event.type] || [];
   for (const h of handlers) { try { h.call(globalThis, event); } catch(e) { console.error(e); } }
   return !event.defaultPrevented;
+};
+
+// HTML "update the current document readiness": set the readiness, then fire
+// `readystatechange` at the document. A document is created already in the
+// "loading" state, and that initial value is not an update, so the host's
+// first assignment fires nothing.
+globalThis.__obscura_setDocumentReadyState = function(state) {
+  const previous = globalThis.__documentReadyState__;
+  if (previous === state) return;
+  globalThis.__documentReadyState__ = state;
+  if (previous === undefined) return;
+  try {
+    globalThis.document.dispatchEvent(new Event('readystatechange'));
+  } catch (e) { console.error(e); }
 };
 
 let _domMutationEpoch = 0;
@@ -5702,8 +5716,20 @@ class Document extends Node {
   }
   dispatchEvent(event) {
     if (!event) return true;
+    if (!event.target) event.target = this;
+    event.currentTarget = this;
+    // `document.onreadystatechange = fn` and its siblings are event handler
+    // IDL attributes, so they run alongside addEventListener handlers.
+    const handler = this['on' + event.type];
+    if (typeof handler === 'function') {
+      try {
+        const ret = handler.call(this, event);
+        if (ret === false) event.preventDefault();
+      } catch(e) { console.error('document event error:', e); }
+    }
     const handlers = (this._listeners?.[event.type] || []).slice();
     for (const h of handlers) { try { h.call(this, event); } catch(e) { console.error('document event error:', e); } }
+    event.currentTarget = null;
     return !event.defaultPrevented;
   }
   createTreeWalker(root, whatToShow, filter) {

@@ -2510,7 +2510,7 @@ impl Page {
         if let Some(js) = &mut self.js {
             let _ = js.execute_script(
                 "<ready-state>",
-                "globalThis.__documentReadyState__ = 'loading';",
+                "globalThis.__obscura_setDocumentReadyState('loading');",
             );
         }
 
@@ -2858,7 +2858,7 @@ impl Page {
         if let Some(js) = &mut self.js {
             let _ = js.execute_script(
                 "<ready-state-interactive>",
-                "globalThis.__documentReadyState__ = 'interactive';",
+                "globalThis.__obscura_setDocumentReadyState('interactive');",
             );
         }
 
@@ -2960,7 +2960,7 @@ impl Page {
             // remains pending until an explicit caller settle/wait.
             let _ = js.execute_script(
                 "<load-event>",
-                "globalThis.__documentReadyState__ = 'complete';\n\
+                "globalThis.__obscura_setDocumentReadyState('complete');\n\
                  try {\n\
                    const loadEvent = new Event('load', {bubbles:false,cancelable:false});\n\
                    if (typeof window.onload === 'function') {\n\
@@ -7054,6 +7054,42 @@ mod tests {
                 .unwrap(),
             serde_json::json!(1.0),
             "window.onload must fire exactly once",
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn document_readiness_updates_fire_readystatechange() {
+        let html = r#"<html><head><script>
+                globalThis.__listenerStates = [];
+                globalThis.__handlerStates = [];
+                globalThis.__targets = [];
+                document.addEventListener('readystatechange', event => {
+                    globalThis.__listenerStates.push(document.readyState);
+                    globalThis.__targets.push(event.target === document);
+                });
+                document.onreadystatechange = () =>
+                    globalThis.__handlerStates.push(document.readyState);
+            </script></head><body></body></html>"#;
+        let mut page =
+            import_map_test_page("readystatechange", "http://127.0.0.1:9", html);
+
+        page.execute_scripts().await;
+
+        let js = page.js.as_mut().unwrap();
+        assert_eq!(
+            js.evaluate("globalThis.__listenerStates").unwrap(),
+            serde_json::json!(["interactive", "complete"]),
+            "every readiness update after the initial 'loading' fires readystatechange",
+        );
+        assert_eq!(
+            js.evaluate("globalThis.__handlerStates").unwrap(),
+            serde_json::json!(["interactive", "complete"]),
+            "the onreadystatechange IDL attribute runs alongside the listeners",
+        );
+        assert_eq!(
+            js.evaluate("globalThis.__targets").unwrap(),
+            serde_json::json!([true, true]),
+            "readystatechange targets the document",
         );
     }
 

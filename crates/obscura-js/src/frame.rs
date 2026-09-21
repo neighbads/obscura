@@ -139,13 +139,12 @@ impl FrameRealm {
     pub fn dispatch_load_events(&self, parent: &mut ObscuraJsRuntime) -> Result<(), String> {
         self.execute_script(
             parent,
-            "globalThis.__documentReadyState__ = 'interactive';\
+            "globalThis.__obscura_setDocumentReadyState('interactive');\
              try { document.dispatchEvent(new Event('DOMContentLoaded', \
                  { bubbles: false, cancelable: false })); } catch (_) {}\
              try { window.dispatchEvent(new Event('DOMContentLoaded', \
                  { bubbles: false, cancelable: false })); } catch (_) {}\
-             globalThis.__documentReadyState__ = 'complete';\
-             try { document.dispatchEvent(new Event('readystatechange')); } catch (_) {}\
+             globalThis.__obscura_setDocumentReadyState('complete');\
              try { const loadEvent = new Event('load', \
                  { bubbles: false, cancelable: false }); \
                  if (typeof window.onload === 'function') { try { window.onload.call(window, loadEvent); } catch (_) {} } \

@@ -2961,13 +2961,7 @@ impl Page {
             let _ = js.execute_script(
                 "<load-event>",
                 "globalThis.__obscura_setDocumentReadyState('complete');\n\
-                 try {\n\
-                   const loadEvent = new Event('load', {bubbles:false,cancelable:false});\n\
-                   if (typeof window.onload === 'function') {\n\
-                     try { window.onload.call(window, loadEvent); } catch(e) {}\n\
-                   }\n\
-                   try { window.dispatchEvent(loadEvent); } catch(e) {}\n\
-                 } catch(e) {}",
+                 try { globalThis.__obscura_fireWindowLoad(); } catch(e) {}",
             );
         }
         if let Some(token) = exec_wd {
@@ -7054,6 +7048,33 @@ mod tests {
                 .unwrap(),
             serde_json::json!(1.0),
             "window.onload must fire exactly once",
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn window_load_event_targets_the_document() {
+        let html = r#"<html><head><script>
+                globalThis.__seen = [];
+                const record = (source, event) => globalThis.__seen.push([
+                    source,
+                    event.target === document,
+                    event.currentTarget === window,
+                    event.eventPhase,
+                ]);
+                window.onload = event => record('handler', event);
+                window.addEventListener('load', event => record('listener', event));
+            </script></head><body></body></html>"#;
+        let mut page = import_map_test_page("window-load-target", "http://127.0.0.1:9", html);
+
+        page.execute_scripts().await;
+
+        assert_eq!(
+            page.js.as_mut().unwrap().evaluate("globalThis.__seen").unwrap(),
+            serde_json::json!([
+                ["handler", true, true, 2],
+                ["listener", true, true, 2],
+            ]),
+            "the window load event carries the legacy target override",
         );
     }
 

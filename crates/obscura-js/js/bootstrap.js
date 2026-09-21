@@ -32,7 +32,8 @@ const __obscuraCore = globalThis.Deno.core;
     '__obscura_hasPendingLoadDelayingScripts', '__obscura_hasPendingParserBlockingScripts',
     '__obscura_nextPendingTimeoutDelay',
     '__obscura_hw', '__obscura_mem',
-    '__documentReadyState__', '__obscura_setDocumentReadyState', '__currentUrl',
+    '__documentReadyState__', '__obscura_setDocumentReadyState',
+    '__obscura_fireWindowLoad', '__currentUrl',
     // internal helpers (var-declared throughout the file)
     '__processDynScriptQueue', '_decodeDataScriptUrl', '_markNative', '_fpRand', '_fpNoise',
     '_fpCache', '_getFp', '_fp', '_splitAsciiWhitespace',
@@ -116,9 +117,30 @@ globalThis.removeEventListener = function(type, fn) {
 };
 globalThis.dispatchEvent = function(event) {
   if (!event) return true;
+  if (!event.target) event.target = globalThis;
+  event.currentTarget = globalThis;
+  event.eventPhase = 2;
   const handlers = globalThis.__windowListeners[event.type] || [];
   for (const h of handlers) { try { h.call(globalThis, event); } catch(e) { console.error(e); } }
+  event.currentTarget = null;
+  event.eventPhase = 0;
   return !event.defaultPrevented;
+};
+
+// HTML "the end" step 7: fire an event named `load` at the Window with the
+// legacy target override flag set, which per DOM dispatch makes the event's
+// target the Document rather than the Window.
+globalThis.__obscura_fireWindowLoad = function() {
+  const event = new Event('load', { bubbles: false, cancelable: false });
+  event.target = globalThis.document || null;
+  if (typeof globalThis.onload === 'function') {
+    event.currentTarget = globalThis;
+    event.eventPhase = 2;
+    try { globalThis.onload.call(globalThis, event); } catch (e) { console.error(e); }
+    event.currentTarget = null;
+    event.eventPhase = 0;
+  }
+  try { globalThis.dispatchEvent(event); } catch (e) { console.error(e); }
 };
 
 // HTML "update the current document readiness": set the readiness, then fire

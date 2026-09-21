@@ -145,10 +145,7 @@ impl FrameRealm {
              try { window.dispatchEvent(new Event('DOMContentLoaded', \
                  { bubbles: false, cancelable: false })); } catch (_) {}\
              globalThis.__obscura_setDocumentReadyState('complete');\
-             try { const loadEvent = new Event('load', \
-                 { bubbles: false, cancelable: false }); \
-                 if (typeof window.onload === 'function') { try { window.onload.call(window, loadEvent); } catch (_) {} } \
-                 try { window.dispatchEvent(loadEvent); } catch (_) {} } catch (_) {}",
+             try { globalThis.__obscura_fireWindowLoad(); } catch (_) {}",
         )
     }
 

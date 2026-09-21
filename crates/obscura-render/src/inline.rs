@@ -13,19 +13,23 @@
 //! OS, so layout remains deterministic unless the operator supplies fonts.
 
 use std::{
+    cell::RefCell,
     collections::{hash_map::DefaultHasher, HashMap, VecDeque},
     hash::{Hash, Hasher},
     path::PathBuf,
-    sync::{Arc, Mutex, OnceLock},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex, OnceLock,
+    },
 };
 
 #[cfg(test)]
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::AtomicUsize;
 
 use cosmic_text::{
-    Align, Attrs, Buffer, CacheKey, CacheKeyFlags, Color, CssLineBreak, CssOverflowWrap,
-    CssWordBreak, Cursor, Family, FeatureTag, FontFeatures, FontSystem, FontVariations, Metrics,
-    Shaping, Style, SwashCache, SwashImage, VariationTag, Weight, Wrap,
+    Align, Attrs, AttrsOwned, Buffer, CacheKey, CacheKeyFlags, CacheMetrics, Color, CssLineBreak,
+    CssOverflowWrap, CssWordBreak, Cursor, Family, FeatureTag, FontFeatures, FontSystem,
+    FontVariations, Metrics, Shaping, Style, SwashCache, SwashImage, VariationTag, Weight, Wrap,
 };
 use swash::scale::{image::Content as SwashContent, Render, ScaleContext, Source, StrikeWith};
 use swash::zeno::{Angle, Format, Transform, Vector};
@@ -224,6 +228,25 @@ struct CachedWebFontSet {
     fonts: Vec<WebFont>,
     bytes: usize,
     database: FontDatabase,
+    /// Namespace shaped runs taken against this database belong to.
+    font_context: u64,
+}
+
+/// A shaped run records `fontdb::ID`s, which are slotmap keys that only mean
+/// anything inside the one database they were allocated from. Two different
+/// web-font sets cloned from the same base database hand out *identical* keys
+/// for their first face, so a shaping cache shared across databases would
+/// silently paint one page's webfont with another's glyphs. Every retained
+/// database therefore carries a distinct context id, and the cross-relayout
+/// shaping cache keys on it. Databases that are not retained (a font set too
+/// large for `WEB_FONT_CACHE_BYTES`) get a fresh id per engine, so their
+/// entries are never reused rather than being reused incorrectly.
+const BASE_FONT_CONTEXT: u64 = 1;
+const EMOJI_FONT_CONTEXT: u64 = 2;
+static NEXT_FONT_CONTEXT: AtomicU64 = AtomicU64::new(3);
+
+fn next_font_context() -> u64 {
+    NEXT_FONT_CONTEXT.fetch_add(1, Ordering::Relaxed)
 }
 
 static FONT_DIRECTORIES: OnceLock<Vec<PathBuf>> = OnceLock::new();
@@ -427,12 +450,12 @@ fn cache_web_font_database(
     fonts: &[WebFont],
     load_emoji: bool,
     database: FontDatabase,
-) -> FontDatabase {
+) -> (FontDatabase, u64) {
     let bytes = fonts
         .iter()
         .fold(0usize, |total, font| total.saturating_add(font.data.len()));
     if bytes > WEB_FONT_CACHE_BYTES {
-        return database;
+        return (database, next_font_context());
     }
 
     let signature = web_font_signature(fonts, load_emoji);
@@ -443,7 +466,7 @@ fn cache_web_font_database(
     if let Some(existing) = cache.iter().find(|entry| {
         entry.signature == signature && entry.load_emoji == load_emoji && entry.fonts == fonts
     }) {
-        return existing.database.clone();
+        return (existing.database.clone(), existing.font_context);
     }
     while cache.len() >= WEB_FONT_CACHE_ENTRIES
         || cache.iter().map(|entry| entry.bytes).sum::<usize>()
@@ -451,14 +474,16 @@ fn cache_web_font_database(
     {
         cache.pop_front();
     }
+    let font_context = next_font_context();
     cache.push_back(Arc::new(CachedWebFontSet {
         signature,
         load_emoji,
         fonts: fonts.to_vec(),
         bytes,
         database: database.clone(),
+        font_context,
     }));
-    database
+    (database, font_context)
 }
 
 fn resolve_loaded_font(
@@ -864,11 +889,175 @@ struct MarkerPlacement {
     content_end: f32,
 }
 
+/// Everything the shaper consumes for one inline formatting context.
+///
+/// cosmic-text caches a shaped line inside the `BufferLine` that produced it,
+/// but a forced relayout builds a brand new [`TextEngine`] with brand new
+/// buffers, so that cache dies with the render pass. This key is what lets the
+/// glyphs survive it. It is deliberately assembled from the exact values handed
+/// to `Buffer::set_rich_text`, so no shaping input can change without changing
+/// the key:
+///
+/// - `spans` holds the already collapsed/`text-transform`ed text, so any text
+///   or `white-space` change produces a different key.
+/// - `AttrsOwned` covers family, resolved face id, weight, style, synthetic
+///   italic, variable axes, optical size, letter spacing, ligature features,
+///   color, glyph metadata, per-span metrics, and the `word-break` /
+///   `overflow-wrap` line-break policy.
+/// - `metrics` is the buffer-level font size and line height.
+/// - `font_context` namespaces the font database the face ids belong to, so a
+///   newly arrived `@font-face` can never resolve against stale glyphs.
+///
+/// Available width is deliberately *not* part of the key. Cached buffers are
+/// stored shaped but not laid out, and cosmic-text recomputes line breaking
+/// from the retained shape whenever the buffer width, wrap mode, or alignment
+/// changes. Width therefore cannot be answered from a stale entry, and a width
+/// change costs only line breaking instead of a full reshape.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct ShapedTextKey {
+    font_context: u64,
+    metrics: CacheMetrics,
+    default_attrs: AttrsOwned,
+    spans: Vec<(String, AttrsOwned)>,
+}
+
+/// Retained shaped buffers are bounded by both entry count and total shaped
+/// text length: a shaped line costs on the order of a hundred bytes per
+/// character, so text length is the honest proxy for the glyph vectors hanging
+/// off it. The budget is sized to hold a full content page's inline text
+/// (tens of KiB) while staying far below the cost of the layout tree itself.
+const SHAPED_TEXT_CACHE_ENTRIES: usize = 4096;
+const SHAPED_TEXT_CACHE_TEXT_BYTES: usize = 256 * 1024;
+
+struct ShapedTextEntry {
+    buffer: Buffer,
+    text_len: usize,
+    /// Second-chance bit: set on every hit, cleared by a purge.
+    used: bool,
+}
+
+/// Process-local, thread-local store of shaped-but-unlaid-out buffers.
+///
+/// Thread-local rather than global: every CDP connection lays out on its own
+/// thread, so this both avoids a lock on the layout hot path and keeps one
+/// page's retained glyphs from being charged to another's.
+#[derive(Default)]
+struct ShapedTextCache {
+    entries: HashMap<ShapedTextKey, ShapedTextEntry>,
+    text_bytes: usize,
+    #[cfg(test)]
+    hits: usize,
+    #[cfg(test)]
+    misses: usize,
+}
+
+impl ShapedTextCache {
+    fn get(&mut self, key: &ShapedTextKey) -> Option<Buffer> {
+        match self.entries.get_mut(key) {
+            Some(entry) => {
+                entry.used = true;
+                #[cfg(test)]
+                {
+                    self.hits += 1;
+                }
+                Some(entry.buffer.clone())
+            }
+            None => {
+                #[cfg(test)]
+                {
+                    self.misses += 1;
+                }
+                None
+            }
+        }
+    }
+
+    fn insert(&mut self, key: ShapedTextKey, buffer: &Buffer) {
+        let text_len = key
+            .spans
+            .iter()
+            .map(|(text, _)| text.len())
+            .sum::<usize>();
+        if self.entries.len() >= SHAPED_TEXT_CACHE_ENTRIES
+            || self.text_bytes + text_len > SHAPED_TEXT_CACHE_TEXT_BYTES
+        {
+            self.purge();
+        }
+        if self.entries.len() >= SHAPED_TEXT_CACHE_ENTRIES
+            || self.text_bytes + text_len > SHAPED_TEXT_CACHE_TEXT_BYTES
+        {
+            return;
+        }
+        if self
+            .entries
+            .insert(
+                key,
+                ShapedTextEntry {
+                    buffer: buffer.clone(),
+                    text_len,
+                    used: false,
+                },
+            )
+            .is_none()
+        {
+            self.text_bytes += text_len;
+        }
+    }
+
+    /// Drop everything untouched since the previous purge, then clear the
+    /// second-chance bits. A page that keeps re-shaping the same text keeps its
+    /// working set; text that scrolled out of the DOM ages out. If one purge
+    /// does not free enough, the whole cache goes.
+    fn purge(&mut self) {
+        let mut retained = 0usize;
+        self.entries.retain(|_, entry| {
+            let keep = entry.used;
+            entry.used = false;
+            if keep {
+                retained += entry.text_len;
+            }
+            keep
+        });
+        self.text_bytes = retained;
+        if self.entries.len() >= SHAPED_TEXT_CACHE_ENTRIES
+            || self.text_bytes >= SHAPED_TEXT_CACHE_TEXT_BYTES
+        {
+            self.entries.clear();
+            self.text_bytes = 0;
+        }
+    }
+}
+
+thread_local! {
+    static SHAPED_TEXT_CACHE: RefCell<ShapedTextCache> = RefCell::new(ShapedTextCache::default());
+}
+
+#[cfg(test)]
+fn shaped_text_cache_reset() {
+    SHAPED_TEXT_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        cache.entries.clear();
+        cache.text_bytes = 0;
+        cache.hits = 0;
+        cache.misses = 0;
+    });
+}
+
+#[cfg(test)]
+fn shaped_text_cache_stats() -> (usize, usize, usize) {
+    SHAPED_TEXT_CACHE.with(|cache| {
+        let cache = cache.borrow();
+        (cache.hits, cache.misses, cache.entries.len())
+    })
+}
+
 /// Owns the font set and shaping caches for one render pass, plus every
 /// inline formatting context discovered while building the tree. Lives in
 /// [`crate::DomLayout`] so paint can rasterize the shaped glyphs.
 pub struct TextEngine {
     font_system: FontSystem,
+    /// Namespace for [`SHAPED_TEXT_CACHE`] lookups; see [`BASE_FONT_CONTEXT`].
+    font_context: u64,
     loaded_families: HashMap<String, LoadedFamily>,
     swash: SwashCache,
     variable_swash: VariableSwashCache,
@@ -1272,10 +1461,17 @@ impl TextEngine {
     }
 
     pub(crate) fn new_with_web_fonts_and_emoji(fonts: &[WebFont], load_emoji: bool) -> Self {
-        let (db, loaded_families) = if fonts.is_empty() {
-            (*base_font_database(load_emoji)).clone()
+        let ((db, loaded_families), font_context) = if fonts.is_empty() {
+            (
+                (*base_font_database(load_emoji)).clone(),
+                if load_emoji {
+                    EMOJI_FONT_CONTEXT
+                } else {
+                    BASE_FONT_CONTEXT
+                },
+            )
         } else if let Some(cached) = cached_web_font_database(fonts, load_emoji) {
-            cached.database.clone()
+            (cached.database.clone(), cached.font_context)
         } else {
             let (mut db, mut loaded_families) = (*base_font_database(load_emoji)).clone();
             let mut declarations = Vec::new();
@@ -1298,6 +1494,7 @@ impl TextEngine {
         let font_system = FontSystem::new_with_locale_and_db("en-US".to_string(), db);
         TextEngine {
             font_system,
+            font_context,
             loaded_families,
             swash: SwashCache::new(),
             variable_swash: VariableSwashCache::new(),
@@ -1620,13 +1817,6 @@ impl TextEngine {
         // ~invisible, matching the intent, and one page can never abort a worker.
         let cosmic_size = base_size.max(1.0);
         let metrics = Metrics::new(cosmic_size, line_h.max(1.0));
-        let mut buffer = Buffer::new(&mut self.font_system, metrics);
-        // Install the used-layout mode now; intrinsic measurement temporarily
-        // swaps to `min_content_wrap` below. Keeping those modes separate is
-        // what prevents `overflow-wrap: break-word` from shrinking a
-        // table/flex min-content contribution while still permitting an
-        // emergency break once the actual line width is known.
-        buffer.set_wrap(&mut self.font_system, layout_wrap);
         // Always Advanced shaping: Basic mis-maps per-span attribute
         // boundaries in the shaping backend (a multi-color run like body text
         // with links ends up coloring the wrong glyphs), and shaping is a
@@ -1651,28 +1841,66 @@ impl TextEngine {
         let marker_attrs = (line_clamp.is_some() || ellipsis_overflow)
             .then(|| spans.last().map(|(_, attrs)| attrs.clone()))
             .flatten();
-        let rich = spans.iter().map(|(text, attrs)| {
-            let variation_index = attrs
-                .variations
-                .as_ref()
-                .map(|variations| {
-                    variation_sets
-                        .iter()
-                        .position(|existing| **existing == **variations)
-                        .expect("collected span variation set")
-                        + 1
-                })
-                .unwrap_or(0);
-            (text.as_str(), attrs.to_attrs(variation_index))
-        });
+        let rich = spans
+            .iter()
+            .map(|(text, attrs)| {
+                let variation_index = attrs
+                    .variations
+                    .as_ref()
+                    .map(|variations| {
+                        variation_sets
+                            .iter()
+                            .position(|existing| **existing == **variations)
+                            .expect("collected span variation set")
+                            + 1
+                    })
+                    .unwrap_or(0);
+                (text.as_str(), attrs.to_attrs(variation_index))
+            })
+            .collect::<Vec<_>>();
         let defaults = Attrs::new().family(Family::Name(FAMILY));
-        buffer.set_rich_text(
-            &mut self.font_system,
-            rich,
-            &defaults,
-            Shaping::Advanced,
-            None,
-        );
+        // Reuse this IFC's glyphs if an earlier relayout already shaped exactly
+        // this text under exactly these attributes. Entries are stored shaped
+        // but not laid out, so wrap mode, alignment, and available width are
+        // still resolved below against the current constraints.
+        let shape_key = ShapedTextKey {
+            font_context: self.font_context,
+            metrics: CacheMetrics::from(metrics),
+            default_attrs: AttrsOwned::new(&defaults),
+            spans: rich
+                .iter()
+                .map(|(text, attrs)| ((*text).to_string(), AttrsOwned::new(attrs)))
+                .collect(),
+        };
+        let cached = SHAPED_TEXT_CACHE.with(|cache| cache.borrow_mut().get(&shape_key));
+        let mut buffer = match cached {
+            Some(buffer) => buffer,
+            None => {
+                let mut buffer = Buffer::new(&mut self.font_system, metrics);
+                buffer.set_rich_text(
+                    &mut self.font_system,
+                    rich.iter().map(|(text, attrs)| (*text, attrs.clone())),
+                    &defaults,
+                    Shaping::Advanced,
+                    None,
+                );
+                // cosmic-text shapes lazily, so force it here: the buffer is
+                // only worth retaining once its glyphs exist, and every inline
+                // formatting context that reaches this point is measured.
+                let tab_width = buffer.tab_width();
+                for line in buffer.lines.iter_mut() {
+                    line.shape(&mut self.font_system, tab_width);
+                }
+                SHAPED_TEXT_CACHE.with(|cache| cache.borrow_mut().insert(shape_key, &buffer));
+                buffer
+            }
+        };
+        // Install the used-layout mode now; intrinsic measurement temporarily
+        // swaps to `min_content_wrap` below. Keeping those modes separate is
+        // what prevents `overflow-wrap: break-word` from shrinking a
+        // table/flex min-content contribution while still permitting an
+        // emergency break once the actual line width is known.
+        buffer.set_wrap(&mut self.font_system, layout_wrap);
 
         let marker_buffer = marker_attrs.map(|attrs| {
             let variation_index = attrs
@@ -1704,10 +1932,11 @@ impl TextEngine {
             Some(taffy::AlignItems::FLEX_END) => Some(Align::End),
             _ => None,
         };
-        if let Some(a) = align {
-            for line in buffer.lines.iter_mut() {
-                line.set_align(Some(a));
-            }
+        // Unconditional: a buffer restored from the shaping cache carries the
+        // alignment of whichever IFC first shaped this text, and alignment is a
+        // layout-only property that is deliberately outside the cache key.
+        for line in buffer.lines.iter_mut() {
+            line.set_align(align);
         }
 
         let idx = self.items.len();
@@ -3857,6 +4086,223 @@ mod tests {
         assert!(
             cached_web_font_database(std::slice::from_ref(&different_descriptor), false).is_none()
         );
+    }
+
+    fn shape_cache_style() -> LayoutStyle {
+        LayoutStyle {
+            display: Display::Block,
+            font_size: Some(16.0),
+            line_height: Some(crate::LineHeight::Px(20.0)),
+            ..Default::default()
+        }
+    }
+
+    /// Lay out and rasterize one paragraph through the ordinary
+    /// build/measure/finalize/paint path, so a shaped-run cache defect shows up
+    /// as either a wrong used size or wrong pixels.
+    fn shape_cache_render(
+        fonts: &[WebFont],
+        text: &str,
+        style: LayoutStyle,
+        width: f32,
+    ) -> ((f32, f32), u64) {
+        let tree = obscura_dom::parse_html(&format!("<p id='copy'>{text}</p>"));
+        let copy = tree.get_element_by_id("copy").unwrap();
+        let mut engine = TextEngine::new_with_web_fonts(fonts);
+        let item = engine
+            .try_build(&tree, copy, &HashMap::from([(copy, style)]))
+            .unwrap();
+        let size = engine.measure(item, Some(width));
+        engine.finalize(item, (0.0, 0.0), width, None);
+        let mut image = tiny_skia::Pixmap::new(400, 200).unwrap();
+        engine.paint_item(item, &mut image, (0.0, 0.0));
+        let mut hasher = DefaultHasher::new();
+        image.data().hash(&mut hasher);
+        (size, hasher.finish())
+    }
+
+    const SHAPE_CACHE_TEXT: &str = "alpha beta gamma delta epsilon zeta eta theta";
+
+    #[test]
+    fn shaped_run_cache_keys_on_text_content() {
+        shaped_text_cache_reset();
+        let first = shape_cache_render(&[], SHAPE_CACHE_TEXT, shape_cache_style(), 300.0);
+        let other = shape_cache_render(
+            &[],
+            "alpha beta gamma delta epsilon zeta eta iota",
+            shape_cache_style(),
+            300.0,
+        );
+        assert_eq!(
+            shaped_text_cache_stats().0,
+            0,
+            "changed text must not reuse a shaped run"
+        );
+        assert_eq!(shaped_text_cache_stats().1, 2);
+        assert_ne!(first.1, other.1);
+
+        let warm = shape_cache_render(&[], SHAPE_CACHE_TEXT, shape_cache_style(), 300.0);
+        assert_eq!(shaped_text_cache_stats().0, 1);
+        assert_eq!(warm, first, "a cache hit must reproduce the cold render");
+    }
+
+    #[test]
+    fn shaped_run_cache_keys_on_font_selection() {
+        shaped_text_cache_reset();
+        let base = shape_cache_render(&[], SHAPE_CACHE_TEXT, shape_cache_style(), 300.0);
+        let variants = [
+            LayoutStyle {
+                font_family: Some("serif".to_string()),
+                ..shape_cache_style()
+            },
+            LayoutStyle {
+                font_size: Some(19.0),
+                ..shape_cache_style()
+            },
+            LayoutStyle {
+                font_weight: Some("700".to_string()),
+                ..shape_cache_style()
+            },
+            LayoutStyle {
+                font_style_italic: Some(true),
+                ..shape_cache_style()
+            },
+            LayoutStyle {
+                letter_spacing: Some(3.0),
+                letter_spacing_non_normal: Some(true),
+                ..shape_cache_style()
+            },
+            LayoutStyle {
+                text_transform: Some(TextTransform::Uppercase),
+                ..shape_cache_style()
+            },
+        ];
+        for (index, style) in variants.into_iter().enumerate() {
+            let rendered = shape_cache_render(&[], SHAPE_CACHE_TEXT, style, 300.0);
+            assert_ne!(rendered.1, base.1, "variant {index} reused base glyphs");
+        }
+        assert_eq!(
+            shaped_text_cache_stats().0,
+            0,
+            "a font or transform change must not reuse a shaped run"
+        );
+    }
+
+    #[test]
+    fn shaped_run_cache_rewraps_when_the_available_width_changes() {
+        shaped_text_cache_reset();
+        let cold_narrow = shape_cache_render(&[], SHAPE_CACHE_TEXT, shape_cache_style(), 90.0);
+
+        shaped_text_cache_reset();
+        let wide = shape_cache_render(&[], SHAPE_CACHE_TEXT, shape_cache_style(), 300.0);
+        let warm_narrow = shape_cache_render(&[], SHAPE_CACHE_TEXT, shape_cache_style(), 90.0);
+
+        let (hits, misses, _) = shaped_text_cache_stats();
+        assert_eq!((hits, misses), (1, 1), "the narrow pass must reuse glyphs");
+        assert!(
+            warm_narrow.0 .1 > wide.0 .1,
+            "the narrow pass must break onto more lines"
+        );
+        assert_eq!(
+            warm_narrow, cold_narrow,
+            "a reused shaped run must re-break at the new width"
+        );
+    }
+
+    #[test]
+    fn shaped_run_cache_invalidates_when_a_web_font_lands() {
+        shaped_text_cache_reset();
+        let style = LayoutStyle {
+            font_family: Some("Issue R30 async fixture".to_string()),
+            ..shape_cache_style()
+        };
+        let cold_style = style.clone();
+        let web_font = |data: &[u8]| WebFont {
+            data: Arc::new(data.to_vec()),
+            family: Some("Issue R30 async fixture".to_string()),
+            weight: Some((400, 400)),
+            italic: Some(false),
+        };
+
+        // Before the @font-face payload arrives the family is unknown and the
+        // text is shaped with the default sans face.
+        let pending = shape_cache_render(&[], SHAPE_CACHE_TEXT, style.clone(), 300.0);
+
+        // Two payloads under one `@font-face` family, as a re-subsetted webfont
+        // delivers: same declared family, same internal face name, and the same
+        // `fontdb::ID` because each engine loads into its own clone of the base
+        // database. Every shaping attribute therefore matches and only the font
+        // context keeps their glyphs apart.
+        let landed = web_font(SANS_B);
+        let replaced = web_font(SANS_BO);
+        let landed_engine = TextEngine::new_with_web_fonts(std::slice::from_ref(&landed));
+        let replaced_engine = TextEngine::new_with_web_fonts(std::slice::from_ref(&replaced));
+        let landed_face = &landed_engine.loaded_families["issue r30 async fixture"].faces[0];
+        let replaced_face = &replaced_engine.loaded_families["issue r30 async fixture"].faces[0];
+        assert_eq!(
+            (landed_face.font_id, &landed_face.name),
+            (replaced_face.font_id, &replaced_face.name),
+            "fixture precondition: both payloads resolve to the same face identity"
+        );
+        assert_ne!(landed_engine.font_context, replaced_engine.font_context);
+
+        let landed_render = shape_cache_render(
+            std::slice::from_ref(&landed),
+            SHAPE_CACHE_TEXT,
+            style.clone(),
+            300.0,
+        );
+        assert_ne!(
+            landed_render, pending,
+            "a landed web font must not reuse the fallback shaping"
+        );
+        let replaced_render = shape_cache_render(
+            std::slice::from_ref(&replaced),
+            SHAPE_CACHE_TEXT,
+            style,
+            300.0,
+        );
+        assert_ne!(
+            replaced_render, landed_render,
+            "a replaced web font must not reuse the previous face's glyphs"
+        );
+        assert_eq!(
+            shaped_text_cache_stats().0,
+            0,
+            "no font change above may resolve from the cache"
+        );
+
+        // The decisive check: the replacement must lay out exactly as it would
+        // have on a cold cache, advances included.
+        shaped_text_cache_reset();
+        assert_eq!(
+            shape_cache_render(
+                std::slice::from_ref(&replaced),
+                SHAPE_CACHE_TEXT,
+                cold_style,
+                300.0,
+            ),
+            replaced_render,
+            "a replaced web font must lay out as it does on a cold cache"
+        );
+    }
+
+    #[test]
+    fn shaped_run_cache_stays_within_its_budget() {
+        shaped_text_cache_reset();
+        for index in 0..(SHAPED_TEXT_CACHE_ENTRIES + 64) {
+            shape_cache_render(
+                &[],
+                &format!("budget probe {index} alpha beta gamma delta epsilon"),
+                shape_cache_style(),
+                300.0,
+            );
+        }
+        let (_, _, entries) = shaped_text_cache_stats();
+        assert!(entries <= SHAPED_TEXT_CACHE_ENTRIES, "entries={entries}");
+        SHAPED_TEXT_CACHE.with(|cache| {
+            assert!(cache.borrow().text_bytes <= SHAPED_TEXT_CACHE_TEXT_BYTES);
+        });
     }
 
     #[test]

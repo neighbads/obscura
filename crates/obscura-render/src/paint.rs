@@ -907,6 +907,76 @@ pub struct PreparedRender {
     selected_images: HashMap<obscura_dom::tree::NodeId, SelectedImage>,
     svg_fonts: Arc<usvg::fontdb::Database>,
     layout: crate::DomLayout,
+    document_scan: DocumentScan,
+}
+
+/// The whole-document scans a rebuild performs purely to re-derive inputs it
+/// already had. Every field is a function of the DOM, the viewport, the base
+/// URL, the media type, and the dynamic-font list, and of nothing else: no
+/// computed style and no resource byte participates. A retained rebuild whose
+/// damage cannot reach any of those inputs carries the previous values forward
+/// instead of walking the document again (see
+/// `retained_document_scan_survives`).
+struct DocumentScan {
+    prepare: PrepareScan,
+    layout: Option<crate::dom::DocumentScan>,
+    media_type: crate::CssMediaType,
+}
+
+impl Default for DocumentScan {
+    fn default() -> Self {
+        Self {
+            prepare: PrepareScan::default(),
+            layout: None,
+            media_type: crate::CssMediaType::Screen,
+        }
+    }
+}
+
+#[derive(Default)]
+struct PrepareScan {
+    /// In document order: the miss queue this feeds is order-sensitive.
+    image_selections: Vec<(obscura_dom::tree::NodeId, SelectedImage)>,
+    font_rules_and_preloads: (Vec<FontRule>, Vec<String>),
+    has_inline_svg_text: bool,
+    /// Attaching a shadow root silently replaces a host's rendered children
+    /// without producing any retained-style mutation, so the scans above must
+    /// not outlive one.
+    shadow_host_count: usize,
+}
+
+/// Whether `previous`'s document scans still describe this rebuild's inputs.
+///
+/// Every mutation must be an inline `style` attribute write. Such a write can
+/// only change computed declarations: it never reaches a selector value, the
+/// rendered-children rules (`slot`, `open`, live textarea value, shadow
+/// attachment), an author source (`<style>` text, `<link rel/media/disabled>`,
+/// a host-fetched sheet), an image selection (`src`, `srcset`, `sizes`,
+/// `<picture>`, `poster`, CORS attributes), a font-face descriptor, or DOM
+/// text. Every other mutation kind either fails this check or has already
+/// forced a full rebuild before reaching here.
+fn retained_document_scan_survives(
+    previous: &PreparedRender,
+    tree: &DomTree,
+    viewport: (f32, f32),
+    base_url: Option<&str>,
+    dynamic_fonts: &[DynamicFontFace],
+    mutations: &[crate::dom::RetainedStyleMutation],
+) -> bool {
+    !mutations.is_empty()
+        && mutations.iter().all(|mutation| {
+            matches!(
+                mutation,
+                crate::dom::RetainedStyleMutation::Attribute(attribute)
+                    if attribute.name.eq_ignore_ascii_case("style")
+            )
+        })
+        && previous.viewport == viewport
+        && previous.base_url.as_deref() == base_url
+        && previous.document_scan.media_type == crate::CssMediaType::Screen
+        && !previous.has_dynamic_fonts
+        && dynamic_fonts.is_empty()
+        && previous.document_scan.prepare.shadow_host_count == tree.shadow_host_count()
 }
 
 impl PreparedRender {
@@ -2364,6 +2434,7 @@ pub fn prepare_dom_with_dynamic_fonts_and_stylesheet_cache_for_media_with_animat
         dynamic_fonts,
         stylesheet_cache,
         None,
+        None,
         media_type,
         animation_sample,
         animation_timeline,
@@ -2535,6 +2606,15 @@ pub fn prepare_dom_with_retained_styles_with_animation_state(
         styles: std::mem::take(&mut previous.layout.styles),
         custom_properties: std::mem::take(&mut previous.layout.custom_properties),
     };
+    let reusable_scan = retained_document_scan_survives(
+        &previous,
+        tree,
+        viewport,
+        base_url,
+        dynamic_fonts,
+        mutations,
+    )
+    .then(|| std::mem::take(&mut previous.document_scan));
     drop(previous);
     prepare_dom_with_dynamic_fonts_and_stylesheet_cache_internal(
         tree,
@@ -2544,6 +2624,7 @@ pub fn prepare_dom_with_retained_styles_with_animation_state(
         dynamic_fonts,
         stylesheet_cache,
         Some((retained, mutations)),
+        reusable_scan,
         crate::CssMediaType::Screen,
         animation_sample,
         animation_timeline,
@@ -2589,6 +2670,7 @@ fn prepare_dom_with_dynamic_fonts_and_stylesheet_cache_internal(
     dynamic_fonts: &[DynamicFontFace],
     stylesheet_cache: &mut crate::css::StylesheetCache,
     retained: Option<(RetainedStyleMaps, &[crate::dom::RetainedStyleMutation])>,
+    reusable_scan: Option<DocumentScan>,
     media_type: crate::CssMediaType,
     animation_sample: crate::AnimationSample,
     animation_timeline: &mut crate::AnimationTimelineState,
@@ -2597,12 +2679,29 @@ fn prepare_dom_with_dynamic_fonts_and_stylesheet_cache_internal(
     {
         return None;
     }
+    let (reused_prepare_scan, mut layout_scan) = match reusable_scan {
+        Some(scan) => (Some(scan.prepare), scan.layout),
+        None => (None, None),
+    };
     // Fetch <img> bytes up front to learn intrinsic sizes for layout (a
     // CSS-sized image with no width/height attribute would otherwise be 0x0
     // and never paint). This seeds the same cache the paint pass reads, so
     // each URL is still fetched at most once.
-    let (mut intrinsic, mut selected_images) =
-        collect_image_intrinsics(tree, viewport, base_url, resources);
+    let prepare_scan = match reused_prepare_scan {
+        Some(scan) => scan,
+        None => PrepareScan {
+            image_selections: collect_image_selections(tree, viewport, base_url),
+            font_rules_and_preloads: collect_web_font_rules(tree, base_url, dynamic_fonts),
+            has_inline_svg_text: has_inline_svg_text(tree),
+            shadow_host_count: tree.shadow_host_count(),
+        },
+    };
+    let mut intrinsic = image_intrinsics_for_selections(&prepare_scan.image_selections, resources);
+    let mut selected_images = prepare_scan
+        .image_selections
+        .iter()
+        .cloned()
+        .collect::<HashMap<_, _>>();
     // Preserve the HTML source fallback separately: a remembered CSS content
     // image temporarily overrides it, but a changed/removed/failed content
     // selection must restore the source before the correction layout.
@@ -2623,11 +2722,12 @@ fn prepare_dom_with_dynamic_fonts_and_stylesheet_cache_internal(
         .collect::<HashMap<_, _>>();
     let seeded_content_images =
         resources.seed_content_image_intrinsics(tree, &mut intrinsic, &mut selected_images);
-    let fonts = collect_web_fonts(tree, base_url, resources, dynamic_fonts);
+    let (font_rules, font_preloads) = &prepare_scan.font_rules_and_preloads;
+    let fonts = load_web_fonts(font_rules, font_preloads, base_url, resources);
     // Most framework pages use web fonts and many decorative SVG icons, but
     // only SVG text needs the page font faces. Avoid cloning/loading the page
     // font database for ordinary icons and HTML-only text.
-    let svg_fonts = if has_inline_svg_text(tree) {
+    let svg_fonts = if prepare_scan.has_inline_svg_text {
         svg_font_database_with_web_fonts(&fonts)
     } else {
         svg_font_database()
@@ -2643,6 +2743,7 @@ fn prepare_dom_with_dynamic_fonts_and_stylesheet_cache_internal(
             mutations,
             animation_sample,
             animation_timeline,
+            Some(&mut layout_scan),
         ),
         None => layout_dom_with_web_fonts_and_stylesheet_cache_for_media_with_animation_state(
             tree,
@@ -2653,6 +2754,7 @@ fn prepare_dom_with_dynamic_fonts_and_stylesheet_cache_internal(
             media_type,
             animation_sample,
             animation_timeline,
+            Some(&mut layout_scan),
         ),
     };
     // `content:url(...)` is computed by the author cascade, whereas ordinary
@@ -2683,6 +2785,7 @@ fn prepare_dom_with_dynamic_fonts_and_stylesheet_cache_internal(
             media_type,
             animation_sample,
             animation_timeline,
+            Some(&mut layout_scan),
         );
     }
     let derived = laid.derived_layout_state(tree, viewport);
@@ -2717,6 +2820,11 @@ fn prepare_dom_with_dynamic_fonts_and_stylesheet_cache_internal(
         selected_images,
         svg_fonts,
         layout: laid,
+        document_scan: DocumentScan {
+            prepare: prepare_scan,
+            layout: layout_scan,
+            media_type,
+        },
     })
 }
 
@@ -7382,26 +7490,26 @@ fn resolve_resource_url(src: &str, base_url: Option<&str>) -> Option<String> {
     }
 }
 
-/// Fetch the Latin/ASCII face from each authored `@font-face` rule and decode
-/// WOFF/WOFF2 into the sfnt bytes consumed by fontdb/cosmic-text. Unicode-range
-/// filtering is load-bearing for performance: generated font packages commonly
-/// emit six or seven script subsets per face, while an English page needs only
-/// the subset containing ASCII.
-fn collect_web_fonts(
+/// One `@font-face` (or script-registered `FontFace`) descriptor set reduced to
+/// what font loading needs. Derived from the DOM and the dynamic-font list
+/// only, so it survives a rebuild that only changed inline `style` attributes.
+struct FontRule {
+    sources: Vec<(String, String)>,
+    family: Option<String>,
+    weight: Option<(u16, u16)>,
+    italic: Option<bool>,
+}
+
+/// Collect the authored `@font-face` rules and the document's font preloads.
+/// Unicode-range filtering happens here and is load-bearing for performance:
+/// generated font packages commonly emit six or seven script subsets per face,
+/// while an English page needs only the subset containing ASCII. DOM-only: no
+/// resource cache, no computed styles.
+fn collect_web_font_rules(
     tree: &DomTree,
     base_url: Option<&str>,
-    cache: &mut RenderResourceCache,
     dynamic_fonts: &[DynamicFontFace],
-) -> Vec<crate::inline::WebFont> {
-    struct FontRule {
-        sources: Vec<(String, String)>,
-        family: Option<String>,
-        weight: Option<(u16, u16)>,
-        italic: Option<bool>,
-    }
-
-    let mut seen = std::collections::HashSet::new();
-    let mut fonts = Vec::new();
+) -> (Vec<FontRule>, Vec<String>) {
     let mut rules = Vec::new();
 
     for nid in crate::dom::rendered_descendants(tree, tree.document()) {
@@ -7487,6 +7595,20 @@ fn collect_web_fonts(
             }
         }
     }
+    (rules, preloads)
+}
+
+/// Fetch and decode the faces named by already-derived rules and preloads.
+/// Always re-run: it is what turns newly landed font bytes into shaped text and
+/// what re-reports a cache-only miss to the page transport.
+fn load_web_fonts(
+    rules: &[FontRule],
+    preloads: &[String],
+    base_url: Option<&str>,
+    cache: &mut RenderResourceCache,
+) -> Vec<crate::inline::WebFont> {
+    let mut seen = std::collections::HashSet::new();
+    let mut fonts = Vec::new();
     for src in preloads.iter().take(16) {
         let key = font_resource_key(src, base_url);
         if !seen.insert(key.clone()) {
@@ -7511,14 +7633,14 @@ fn collect_web_fonts(
         if fonts.len() >= 16 {
             break;
         }
-        for (key, src) in rule.sources {
-            if !seen.insert(key) {
+        for (key, src) in &rule.sources {
+            if !seen.insert(key.clone()) {
                 continue;
             }
-            if let Some(decoded) = fetch_and_decode_font(&src, base_url, cache) {
+            if let Some(decoded) = fetch_and_decode_font(src, base_url, cache) {
                 fonts.push(crate::inline::WebFont {
                     data: decoded,
-                    family: rule.family,
+                    family: rule.family.clone(),
                     weight: rule.weight,
                     italic: rule.italic,
                 });
@@ -9493,23 +9615,18 @@ fn paint_positioned_pseudo(
     }
 }
 
-/// Fetch every `<img>` once (seeding `cache` for the paint pass) and record its
-/// intrinsic (width, height) so layout can size replaced elements that have no
-/// explicit dimensions. Video posters are image resources too: before a
-/// decoded frame exists, their intrinsic dimensions and pixels are the
-/// replaced content Chromium paints for `<video>`. Keyed by the element's
-/// NodeId.
-fn collect_image_intrinsics(
+/// Resolve which image resource each `<img>` renders, in document order. Video
+/// posters are image resources too: before a decoded frame exists, their
+/// dimensions and pixels are the replaced content Chromium paints for
+/// `<video>`. Reads only the DOM and the viewport, never the resource cache or
+/// any computed style, so the result is reusable across a rebuild that only
+/// changed inline `style` attributes.
+fn collect_image_selections(
     tree: &DomTree,
     viewport: (f32, f32),
     base_url: Option<&str>,
-    cache: &mut RenderResourceCache,
-) -> (
-    HashMap<obscura_dom::tree::NodeId, crate::ReplacedIntrinsic>,
-    HashMap<obscura_dom::tree::NodeId, SelectedImage>,
-) {
-    let mut out = std::collections::HashMap::new();
-    let mut selected = HashMap::new();
+) -> Vec<(obscura_dom::tree::NodeId, SelectedImage)> {
+    let mut selected = Vec::new();
     for nid in crate::dom::rendered_descendants(tree, tree.document()) {
         let Some(node) = tree.get_node(nid) else {
             continue;
@@ -9537,27 +9654,49 @@ fn collect_image_intrinsics(
             _ => continue,
         };
         let resolved_url = resolve_resource_url(&url, base_url).unwrap_or(url);
-        let profile = image_request_profile(tree, nid);
-        selected.insert(
+        selected.push((
             nid,
             SelectedImage {
-                resolved_url: resolved_url.clone(),
+                resolved_url,
                 density,
-                profile,
+                profile: image_request_profile(tree, nid),
             },
-        );
-        let Some(bytes) = fetch_profiled_image_bytes(&resolved_url, None, cache, profile) else {
+        ));
+    }
+    selected
+}
+
+/// Fetch each selected image once (seeding `cache` for the paint pass) and
+/// record its intrinsic (width, height) so layout can size replaced elements
+/// that have no explicit dimensions. Keyed by the element's NodeId.
+///
+/// Always re-run, even when the selections were reused: this is what turns
+/// newly landed bytes into geometry and what re-reports a cache-only miss to
+/// the page transport. Walking the selections in document order keeps the miss
+/// queue (and therefore the transport's request order) deterministic.
+fn image_intrinsics_for_selections(
+    selected: &[(obscura_dom::tree::NodeId, SelectedImage)],
+    cache: &mut RenderResourceCache,
+) -> HashMap<obscura_dom::tree::NodeId, crate::ReplacedIntrinsic> {
+    let mut out = std::collections::HashMap::new();
+    for (nid, selection) in selected {
+        let Some(bytes) = fetch_profiled_image_bytes(
+            &selection.resolved_url,
+            None,
+            cache,
+            selection.profile,
+        ) else {
             continue;
         };
         if let Some(mut intrinsic) = image_intrinsic_metadata(&bytes) {
             // A 2x (or w-descriptor) candidate's raw pixels are density times
             // its CSS size. A ratio is dimensionless and remains unchanged.
-            intrinsic.width = intrinsic.width.map(|width| width / density);
-            intrinsic.height = intrinsic.height.map(|height| height / density);
-            out.insert(nid, intrinsic);
+            intrinsic.width = intrinsic.width.map(|width| width / selection.density);
+            intrinsic.height = intrinsic.height.map(|height| height / selection.density);
+            out.insert(*nid, intrinsic);
         }
     }
-    (out, selected)
+    out
 }
 
 /// Add intrinsic metadata for CSS `content:url(...)` images after the first
@@ -16214,11 +16353,13 @@ mod tests {
             }
         });
 
-        let fonts = collect_web_fonts(
-            &tree,
+        let (rules, preloads) =
+            collect_web_font_rules(&tree, Some("https://example.test/page.html"), &[]);
+        let fonts = load_web_fonts(
+            &rules,
+            &preloads,
             Some("https://example.test/page.html"),
             &mut resources,
-            &[],
         );
 
         assert_eq!(fonts.len(), 1);
@@ -17992,4 +18133,5 @@ mod tests {
         assert!(at_end.layout.styles[&overlay].effectively_invisible);
         assert!(!at_end.has_active_css_animations());
     }
+
 }

@@ -553,6 +553,14 @@ impl DomTree {
         self.inner.borrow().shadow_roots.contains_key(&node)
     }
 
+    /// How many hosts currently carry a native shadow root. Attaching one
+    /// replaces the host's rendered children without going through any DOM
+    /// mutation command, so renderer caches keyed on the rendered tree use
+    /// this as their witness that no root appeared or disappeared.
+    pub fn shadow_host_count(&self) -> usize {
+        self.inner.borrow().shadow_roots_by_host.len()
+    }
+
     /// Return the root of `node`'s local tree scope. This follows ordinary
     /// parent links only, so a shadow descendant resolves to its ShadowRoot and
     /// a light descendant resolves to its document or detached subtree root.

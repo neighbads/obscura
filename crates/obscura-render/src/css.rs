@@ -2481,6 +2481,30 @@ impl StylesheetCache {
         (sheet, false)
     }
 
+    /// Whether `get_or_parse` for the sources that produced `sheet` would
+    /// still return `sheet` as a hit. The retained document scan carries the
+    /// previous sheet forward instead of re-collecting and re-comparing every
+    /// author source, so it needs proof that the single cache entry is still
+    /// the very same parse at the same viewport and media type. Counted as a
+    /// hit so cache telemetry stays identical to the comparison it replaces.
+    pub(crate) fn reuse_retained(
+        &mut self,
+        sheet: &Arc<Stylesheet>,
+        viewport: (f32, f32),
+        media_type: CssMediaType,
+    ) -> bool {
+        let viewport_bits = (viewport.0.to_bits(), viewport.1.to_bits());
+        let retained = self.entry.as_ref().is_some_and(|entry| {
+            entry.viewport_bits == viewport_bits
+                && entry.media_type == media_type
+                && Arc::ptr_eq(&entry.sheet, sheet)
+        });
+        if retained {
+            self.hits = self.hits.saturating_add(1);
+        }
+        retained
+    }
+
     pub fn hit_count(&self) -> u64 {
         self.hits
     }

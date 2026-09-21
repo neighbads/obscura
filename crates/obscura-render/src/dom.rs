@@ -360,6 +360,24 @@ pub struct DomLayout {
     /// no DOM node of their own, but unlike the legacy text-only fast path
     /// they participate in layout with their pseudo style's real box model.
     pub(crate) generated_boxes: Vec<GeneratedBox>,
+    /// Whether any DOM text node in this document carries a character that
+    /// needs the emoji face. Retained across rebuilds whose damage cannot
+    /// reach DOM text (see `DocumentScan`); generated-content emoji are
+    /// recomputed from the live styles every rebuild.
+    pub(crate) emoji_text_in_dom: bool,
+}
+
+/// Document-scope layout inputs that are re-derived by whole-tree scans on
+/// every rebuild even when nothing they read has changed: the parsed author
+/// stylesheet, the shadow-scoped sheets, and the DOM-text half of the emoji
+/// font decision. None of them can be changed by inline `style` attribute
+/// damage, so a retained rebuild carries the previous values forward instead
+/// of walking the document again.
+#[derive(Clone)]
+pub(crate) struct DocumentScan {
+    pub sheet: std::sync::Arc<crate::css::Stylesheet>,
+    pub shadow_sheets: HashMap<NodeId, std::sync::Arc<crate::css::Stylesheet>>,
+    pub emoji_text_in_dom: bool,
 }
 
 /// One connected element attribute mutation eligible for conservative
@@ -4205,6 +4223,7 @@ pub(crate) fn layout_dom_with_web_fonts_and_stylesheet_cache_with_animation_stat
         crate::CssMediaType::Screen,
         animation_sample,
         animation_timeline,
+        None,
     )
 }
 
@@ -4217,6 +4236,7 @@ pub(crate) fn layout_dom_with_web_fonts_and_stylesheet_cache_for_media_with_anim
     media_type: crate::CssMediaType,
     animation_sample: crate::AnimationSample,
     animation_timeline: &mut crate::AnimationTimelineState,
+    document_scan: Option<&mut Option<DocumentScan>>,
 ) -> DomLayout {
     layout_dom_with_web_fonts_pass_limit_at_animation_time(
         tree,
@@ -4230,6 +4250,7 @@ pub(crate) fn layout_dom_with_web_fonts_and_stylesheet_cache_for_media_with_anim
         media_type,
         animation_sample,
         animation_timeline,
+        document_scan,
     )
     .0
 }
@@ -4280,6 +4301,7 @@ pub(crate) fn layout_dom_with_web_fonts_and_retained_styles_at_animation_time(
             mode: crate::AnimationSampleMode::DocumentTime,
         },
         &mut animation_timeline,
+        None,
     )
 }
 
@@ -4293,6 +4315,7 @@ pub(crate) fn layout_dom_with_web_fonts_and_retained_styles_with_animation_state
     mutations: &[RetainedStyleMutation],
     animation_sample: crate::AnimationSample,
     animation_timeline: &mut crate::AnimationTimelineState,
+    document_scan: Option<&mut Option<DocumentScan>>,
 ) -> DomLayout {
     layout_dom_with_web_fonts_pass_limit_at_animation_time(
         tree,
@@ -4306,6 +4329,7 @@ pub(crate) fn layout_dom_with_web_fonts_and_retained_styles_with_animation_state
         crate::CssMediaType::Screen,
         animation_sample,
         animation_timeline,
+        document_scan,
     )
     .0
 }
@@ -4342,6 +4366,7 @@ fn layout_dom_with_web_fonts_pass_limit(
         crate::CssMediaType::Screen,
         crate::AnimationSample::default(),
         &mut animation_timeline,
+        None,
     )
 }
 
@@ -4420,60 +4445,90 @@ fn layout_dom_with_web_fonts_pass_limit_at_animation_time(
     intrinsic: &ReplacedIntrinsicMap,
     fonts: &[crate::inline::WebFont],
     pass_limit: Option<usize>,
-    stylesheet_cache: Option<&mut crate::css::StylesheetCache>,
+    mut stylesheet_cache: Option<&mut crate::css::StylesheetCache>,
     retained: Option<RetainedStyleMaps>,
     mutations: &[RetainedStyleMutation],
     media_type: crate::CssMediaType,
     animation_sample: crate::AnimationSample,
     animation_timeline: &mut crate::AnimationTimelineState,
+    mut document_scan: Option<&mut Option<DocumentScan>>,
 ) -> (DomLayout, ContainerLayoutTelemetry) {
     let timing = std::env::var("OBSCURA_RENDER_TIMING").is_ok();
 
-    // Collect inline and host-fetched author sheets in document order. Loaded
-    // cross-origin bytes remain outside the page-visible DOM.
-    let external = tree.external_stylesheets();
-    let mut css_sources = Vec::new();
-    for nid in tree.descendants(tree.document()) {
-        if let Some(node) = tree.get_node(nid) {
-            if let Some(elem) = node.as_element() {
-                let media_applies = node.get_attribute("media").is_none_or(|media| {
-                    media.trim().is_empty()
-                        || crate::css::media_query_applies_for_viewport_and_type(
-                            media, viewport, media_type,
-                        )
-                });
-                let linked = elem.local.as_ref() == "link"
-                    && node.get_attribute("disabled").is_none()
-                    && node.get_attribute("rel").is_some_and(|rel| {
-                        rel.split_ascii_whitespace()
-                            .any(|part| part.eq_ignore_ascii_case("stylesheet"))
-                    });
-                if media_applies && (linked || elem.local.as_ref() == "style") {
-                    if let Some(sheet) = external.get(&nid) {
-                        css_sources.extend(sheet.sources.iter().map(ToString::to_string));
+    let t0 = std::time::Instant::now();
+    // A retained rebuild whose damage cannot reach any author source carries
+    // the previous parse forward. The single-entry cache still has to prove it
+    // holds that exact parse: only then would re-collecting and re-comparing
+    // every source return it again as a hit.
+    let reused_scan = document_scan
+        .as_deref()
+        .and_then(|scan| scan.as_ref())
+        .filter(|scan| {
+            stylesheet_cache
+                .as_deref_mut()
+                .is_some_and(|cache| cache.reuse_retained(&scan.sheet, viewport, media_type))
+        })
+        .cloned();
+    let (sheet, shadow_sheets, stylesheet_cache_hit, reused_emoji_text) = match reused_scan {
+        Some(scan) => (
+            scan.sheet,
+            scan.shadow_sheets,
+            true,
+            Some(scan.emoji_text_in_dom),
+        ),
+        None => {
+            // Collect inline and host-fetched author sheets in document order.
+            // Loaded cross-origin bytes remain outside the page-visible DOM.
+            let external = tree.external_stylesheets();
+            let mut css_sources = Vec::new();
+            for nid in tree.descendants(tree.document()) {
+                if let Some(node) = tree.get_node(nid) {
+                    if let Some(elem) = node.as_element() {
+                        let media_applies = node.get_attribute("media").is_none_or(|media| {
+                            media.trim().is_empty()
+                                || crate::css::media_query_applies_for_viewport_and_type(
+                                    media, viewport, media_type,
+                                )
+                        });
+                        let linked = elem.local.as_ref() == "link"
+                            && node.get_attribute("disabled").is_none()
+                            && node.get_attribute("rel").is_some_and(|rel| {
+                                rel.split_ascii_whitespace()
+                                    .any(|part| part.eq_ignore_ascii_case("stylesheet"))
+                            });
+                        if media_applies && (linked || elem.local.as_ref() == "style") {
+                            if let Some(sheet) = external.get(&nid) {
+                                css_sources
+                                    .extend(sheet.sources.iter().map(ToString::to_string));
+                            }
+                        }
+                        if media_applies && elem.local.as_ref() == "style" {
+                            css_sources.push(tree.text_content(nid));
+                        }
                     }
                 }
-                if media_applies && elem.local.as_ref() == "style" {
-                    css_sources.push(tree.text_content(nid));
-                }
             }
-        }
-    }
 
-    let t0 = std::time::Instant::now();
-    let (sheet, stylesheet_cache_hit) = match stylesheet_cache {
-        Some(cache) => cache.get_or_parse(tree, &css_sources, viewport, media_type),
-        None => (
-            std::sync::Arc::new(crate::css::Stylesheet::parse_for_viewport_and_media(
-                tree,
-                &css_sources,
-                viewport,
-                media_type,
-            )),
-            false,
-        ),
+            let (sheet, stylesheet_cache_hit) = match stylesheet_cache.as_deref_mut() {
+                Some(cache) => cache.get_or_parse(tree, &css_sources, viewport, media_type),
+                None => (
+                    std::sync::Arc::new(crate::css::Stylesheet::parse_for_viewport_and_media(
+                        tree,
+                        &css_sources,
+                        viewport,
+                        media_type,
+                    )),
+                    false,
+                ),
+            };
+            (
+                sheet,
+                collect_shadow_stylesheets(tree, viewport, media_type),
+                stylesheet_cache_hit,
+                None,
+            )
+        }
     };
-    let shadow_sheets = collect_shadow_stylesheets(tree, viewport, media_type);
     let t_parse = t0.elapsed();
 
     let retained_requested = retained.as_ref().map_or(0, |retained| retained.styles.len());
@@ -4570,7 +4625,16 @@ fn layout_dom_with_web_fonts_pass_limit_at_animation_time(
             retained,
             animation_sample,
             animation_timeline,
+            reused_emoji_text,
         );
+    let emoji_text_in_dom = laid.emoji_text_in_dom;
+    if let Some(slot) = document_scan.as_deref_mut() {
+        *slot = Some(DocumentScan {
+            sheet: std::sync::Arc::clone(&sheet),
+            shadow_sheets: shadow_sheets.clone(),
+            emoji_text_in_dom,
+        });
+    }
     if !sheet.has_container_queries() {
         if timing {
             let (r, i, c, a, l, u) = sheet.debug_stats();
@@ -4659,6 +4723,7 @@ fn layout_dom_with_web_fonts_pass_limit_at_animation_time(
                 None,
                 animation_sample,
                 animation_timeline,
+                Some(emoji_text_in_dom),
             );
         passes = pass;
         query.evaluations += pass_query.evaluations;
@@ -4717,6 +4782,7 @@ fn layout_dom_with_web_fonts_pass_limit_at_animation_time(
                 None,
                 animation_sample,
                 animation_timeline,
+                Some(emoji_text_in_dom),
             );
         laid = fallback;
         passes += 1;
@@ -4754,6 +4820,7 @@ fn layout_dom_once(
     retained: Option<(RetainedStyleMaps, HashSet<NodeId>)>,
     animation_sample: crate::AnimationSample,
     animation_timeline: &mut crate::AnimationTimelineState,
+    reused_emoji_text: Option<bool>,
 ) -> (
     DomLayout,
     Option<crate::css::ContainerDecisionSignature>,
@@ -4811,14 +4878,21 @@ fn layout_dom_once(
     grow_trailing_auto_cells(tree, &mut styles);
 
     let descendants = tree.descendants(tree.document());
-    let needs_emoji_font = descendants.iter().any(|id| {
-        tree.get_node(*id).is_some_and(|node| match &node.data {
-            obscura_dom::tree::NodeData::Text { contents } => {
-                crate::inline::text_may_need_emoji_font(contents)
-            }
-            _ => false,
+    // The DOM-text half depends only on text nodes, so a rebuild whose damage
+    // cannot reach them reuses it. Generated content is read from the live
+    // computed styles every time: an inline custom property can feed `content`
+    // through `var()`, so that half is never retained.
+    let emoji_text_in_dom = reused_emoji_text.unwrap_or_else(|| {
+        descendants.iter().any(|id| {
+            tree.get_node(*id).is_some_and(|node| match &node.data {
+                obscura_dom::tree::NodeData::Text { contents } => {
+                    crate::inline::text_may_need_emoji_font(contents)
+                }
+                _ => false,
+            })
         })
-    }) || styles.values().any(|style| {
+    });
+    let needs_emoji_font = emoji_text_in_dom || styles.values().any(|style| {
         style
             .before_content
             .as_deref()
@@ -7401,6 +7475,7 @@ fn layout_dom_once(
             #[cfg(feature = "paint")]
             word_ifc_items: ifc_items.word_items,
             generated_boxes,
+            emoji_text_in_dom,
         },
         signature,
         query_stats,
@@ -17075,6 +17150,7 @@ mod tests {
             crate::CssMediaType::Screen,
             crate::AnimationSample::document(0.0),
             &mut timeline,
+            None,
         );
         let retained = RetainedStyleMaps {
             styles: std::mem::take(&mut initial.styles),
@@ -17093,6 +17169,7 @@ mod tests {
                 crate::CssMediaType::Screen,
                 crate::AnimationSample::document(500.0),
                 &mut timeline,
+                None,
             );
         let mut full_timeline = crate::AnimationTimelineState::default();
         let (full, _) = layout_dom_with_web_fonts_pass_limit_at_animation_time(
@@ -17107,6 +17184,7 @@ mod tests {
             crate::CssMediaType::Screen,
             crate::AnimationSample::document(500.0),
             &mut full_timeline,
+            None,
         );
 
         assert_computed_styles_match("animation retained-vs-full", &incremental, &full);
@@ -17157,6 +17235,7 @@ mod tests {
             None,
             crate::AnimationSample::document(0.0),
             &mut timeline,
+            None,
         );
         // Sanity check on the premise: under the definite 60px ancestor, the
         // percent height must have survived uncollapsed for taffy to resolve.
@@ -17187,6 +17266,7 @@ mod tests {
             Some((retained, fresh)),
             crate::AnimationSample::document(0.0),
             &mut timeline,
+            None,
         );
 
         let full_tree = parse_html(

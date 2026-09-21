@@ -104,13 +104,20 @@ impl FrameRealm {
         // Both ids before init, not after: init is what installs `parent` and
         // `top`, and a document that runs even one script believing it is
         // top-level has already taken the wrong branch.
+        //
+        // The page marks its own parser-discovered scripts already started so
+        // that moving one does not run it a second time; a frame document owns
+        // the same flag and has to claim its scripts the same way, before any
+        // of its code can move them.
         realm
             .run(
                 parent,
                 &format!(
                     "globalThis.__obscura_frameId = {frame_id};\
                      globalThis.__obscura_parentFrameId = {parent_frame_id};\
-                     globalThis.__obscura_init();"
+                     globalThis.__obscura_init();\
+                     globalThis.__markParserScripts(\
+                       [...document.querySelectorAll('script')].map(node => node._nid));"
                 ),
             )
             .ok()?;
@@ -634,6 +641,46 @@ mod tests {
                 )
                 .unwrap(),
             serde_json::json!([true, 9, 8, 7])
+        );
+    }
+
+    /// A script a frame inserts itself has to be claimed against the frame's
+    /// document. Claiming it against the page's meant the claim always failed,
+    /// so no frame ever ran a dynamically inserted script; the frame's own
+    /// parser scripts must still be claimed up front, or re-inserting one would
+    /// run it a second time.
+    #[test]
+    fn frame_runs_each_of_its_scripts_exactly_once() {
+        let mut parent = page(
+            "https://parent.example/page",
+            "<html><body><div id='p'></div><div id='q'></div></body></html>",
+        );
+        let frame = FrameRealm::new(
+            &mut parent,
+            1,
+            0,
+            "https://child.example/frame",
+            "<html><body><script>globalThis.parserRuns = (globalThis.parserRuns || 0) + 1;\
+             </script></body></html>",
+        )
+        .expect("frame realm");
+        assert!(frame.run_document_scripts(&mut parent, |_| None).is_empty());
+
+        assert_eq!(
+            frame
+                .evaluate(
+                    &mut parent,
+                    r#"(() => {
+                        const inserted = document.createElement('script');
+                        inserted.textContent = "globalThis.insertedRuns = 1;";
+                        document.body.appendChild(inserted);
+                        // Re-inserting a parser script must not start it again.
+                        document.body.appendChild(document.querySelector('script'));
+                        return [globalThis.insertedRuns || 0, globalThis.parserRuns || 0];
+                    })()"#,
+                )
+                .unwrap(),
+            serde_json::json!([1, 1])
         );
     }
 

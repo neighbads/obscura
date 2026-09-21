@@ -12458,6 +12458,22 @@ function _ensureWindowNamedProperty(name) {
   try {
     Object.defineProperty(globalThis, name, {
       get() { return _windowNamedValue(name); },
+      // Named properties live on the WindowProperties object in Window's
+      // prototype chain, so `window.foo = x` is an ordinary [[Set]] that
+      // creates an own data property on Window and shadows the element. An
+      // accessor without a setter would instead throw in strict mode, which
+      // breaks any page carrying an element whose id matches a global it
+      // assigns (Next.js writes window.__NEXT_DATA__ next to
+      // <script id="__NEXT_DATA__">).
+      set(value) {
+        _windowNamedPropertyNames.delete(name);
+        Object.defineProperty(globalThis, name, {
+          value,
+          writable: true,
+          enumerable: true,
+          configurable: true,
+        });
+      },
       configurable: true,
       enumerable: true,
     });

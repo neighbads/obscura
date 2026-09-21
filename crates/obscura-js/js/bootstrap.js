@@ -105,14 +105,24 @@ globalThis.onunhandledrejection = function(e) { if (e?.preventDefault) e.prevent
 globalThis.onerror = function(msg, src, line, col, error) {
   globalThis.__obscura_errors.push({msg: String(msg), src: String(src||""), line, error: String(error||"")});
 };
+// Set once any capture listener is registered anywhere. Pages that never use
+// capture skip the ancestor walk in `_runCapturePhase` entirely.
+var _anyCaptureListeners = false;
+// Entries are { callback, capture }: the window sits on the event path of
+// every node in the document, so its capture listeners have to be
+// distinguishable from its bubble listeners (see `_runCapturePhase`).
 globalThis.__windowListeners = {};
-globalThis.addEventListener = function(type, fn) {
+globalThis.addEventListener = function(type, fn, options) {
   if (!globalThis.__windowListeners[type]) globalThis.__windowListeners[type] = [];
-  globalThis.__windowListeners[type].push(fn);
+  const capture = _eventCapture(options);
+  if (capture) _anyCaptureListeners = true;
+  globalThis.__windowListeners[type].push({ callback: fn, capture });
 };
-globalThis.removeEventListener = function(type, fn) {
+globalThis.removeEventListener = function(type, fn, options) {
   if (globalThis.__windowListeners[type]) {
-    globalThis.__windowListeners[type] = globalThis.__windowListeners[type].filter(h => h !== fn);
+    const capture = _eventCapture(options);
+    globalThis.__windowListeners[type] = globalThis.__windowListeners[type]
+      .filter(entry => !(entry.callback === fn && entry.capture === capture));
   }
 };
 globalThis.dispatchEvent = function(event) {
@@ -120,8 +130,12 @@ globalThis.dispatchEvent = function(event) {
   if (!event.target) event.target = globalThis;
   event.currentTarget = globalThis;
   event.eventPhase = 2;
-  const handlers = globalThis.__windowListeners[event.type] || [];
-  for (const h of handlers) { try { h.call(globalThis, event); } catch(e) { console.error(e); } }
+  // At the target both capture and bubble listeners run, in registration order.
+  const handlers = (globalThis.__windowListeners[event.type] || []).slice();
+  for (const h of handlers) {
+    try { h.callback.call(globalThis, event); } catch(e) { console.error(e); }
+    if (event._immediatePropagationStopped) break;
+  }
   event.currentTarget = null;
   event.eventPhase = 0;
   return !event.defaultPrevented;
@@ -697,9 +711,11 @@ async function _loadLinkedStylesheet(c) {
       globalThis.__obscura_frameId || 0
     );
     _registerLinkedStylesheet(c, loaded.responseUrl);
-    try { c.dispatchEvent(new Event('load', { bubbles: true })); } catch(e) {}
+    // `load` / `error` on a link element do not bubble; a document-wide
+    // listener reaches them through the capture phase.
+    try { c.dispatchEvent(new Event('load')); } catch(e) {}
   } catch(e) {
-    try { c.dispatchEvent(new Event('error', { bubbles: true })); } catch(e) {}
+    try { c.dispatchEvent(new Event('error')); } catch(e) {}
   }
 }
 
@@ -1911,6 +1927,7 @@ function _eventTargetAdd(target, type, callback, options) {
     byType.set(type, listeners);
   }
   if (listeners.some((entry) => entry.callback === callback && entry.capture === capture)) return;
+  if (capture) _anyCaptureListeners = true;
   const entry = {
     callback,
     capture,
@@ -1944,6 +1961,50 @@ function _eventTargetRemove(target, type, callback, options) {
   if (listeners.length === 0) byType.delete(type);
   if (byType.size === 0) _eventTargetListeners.delete(target);
 }
+// The listener list a node keeps for `type`, whichever store it uses.
+function _listenerEntriesFor(node, type) {
+  if (node === globalThis) return globalThis.__windowListeners[type];
+  if (node instanceof Document) return node._listeners && node._listeners[type];
+  return _eventTargetListeners.get(node)?.get(String(type));
+}
+
+// DOM dispatch, capture phase: before the event reaches its target, the
+// capture listeners of every ancestor run from the outermost inward. The
+// window is the outermost ancestor of a node in the document. Without this
+// phase a non-bubbling event -- `load` and `error` on a resource element are
+// exactly that -- is only ever visible on the element itself, so the
+// document-wide resource listener every asset loader installs sees nothing.
+function _runCapturePhase(target, event) {
+  if (!_anyCaptureListeners) return;
+  const path = [];
+  let node = target.parentNode;
+  while (node) { path.push(node); node = node.parentNode; }
+  // A detached subtree's path stops at its own root: neither the document nor
+  // the window is on it.
+  if (path.length && path[path.length - 1] === globalThis.document) path.push(globalThis);
+  if (!path.length) return;
+  event.eventPhase = 1;
+  for (let i = path.length - 1; i >= 0; i--) {
+    if (event._propagationStopped) break;
+    const current = path[i];
+    const entries = _listenerEntriesFor(current, event.type);
+    if (!entries || !entries.length) continue;
+    event.currentTarget = current;
+    for (const entry of entries.slice()) {
+      if (!entry.capture) continue;
+      if (entry.once) _eventTargetRemove(current, event.type, entry.callback, entry.capture);
+      const callback = entry.callback;
+      try {
+        if (typeof callback === "function") callback.call(current, event);
+        else if (callback && typeof callback.handleEvent === "function") callback.handleEvent.call(callback, event);
+      } catch (error) { console.error(error); }
+      if (event._immediatePropagationStopped) break;
+    }
+  }
+  event.currentTarget = null;
+  event.eventPhase = 0;
+}
+
 function _eventTargetDispatch(target, event) {
   if (!event || typeof event.type === "undefined") {
     throw new TypeError("Failed to execute 'dispatchEvent' on 'EventTarget': parameter 1 is not of type 'Event'.");
@@ -1951,13 +2012,17 @@ function _eventTargetDispatch(target, event) {
   if (String(event.type) === "") {
     throw new DOMException("The event's type was not specified.", "InvalidStateError");
   }
+  // Ancestors are reached here only by the bubble path, where capture
+  // listeners must not run again: `_runCapturePhase` already delivered them.
+  const atTarget = !event.target || event.target === target;
   if (!event.target) event.target = target;
   event.currentTarget = target;
-  event.eventPhase = 2;
+  event.eventPhase = atTarget ? 2 : 3;
   const listeners = (_eventTargetListeners.get(target)?.get(String(event.type)) || []).slice();
   for (const entry of listeners) {
     const current = _eventTargetListeners.get(target)?.get(String(event.type));
     if (!current || !current.includes(entry)) continue;
+    if (!atTarget && entry.capture) continue;
     if (entry.once) _eventTargetRemove(target, event.type, entry.callback, entry.capture);
     const callback = entry.callback;
     try {
@@ -3863,6 +3928,14 @@ class Element extends Node {
   dispatchEvent(event) {
     if (!event) return true;
     if (!event.target) event.target = this;
+    // The capture phase belongs to the whole dispatch, not to each node the
+    // event passes through: the bubble path below re-enters this method on
+    // every ancestor.
+    if (!event._obscuraCaptured) {
+      event._obscuraCaptured = true;
+      _runCapturePhase(this, event);
+      if (event._propagationStopped) return !event.defaultPrevented;
+    }
     event.currentTarget = this;
     // Spec: inline `onclick="..."` content attributes are event handlers
     // for the matching event type. Fire them alongside any
@@ -5725,21 +5798,34 @@ class Document extends Node {
     return new Cls('');
   }
   createRange() { return new Range(); }
+  // Entries are { callback, capture }. The document is on the event path of
+  // every node below it, so a capture listener here must be able to see an
+  // element's non-bubbling `load` / `error` (see `_runCapturePhase`).
   addEventListener(type, fn, opts) {
     if (typeof fn !== 'function') return;
     if (!this._listeners) this._listeners = {};
     if (!this._listeners[type]) this._listeners[type] = [];
-    if (!this._listeners[type].includes(fn)) this._listeners[type].push(fn);
+    const capture = _eventCapture(opts);
+    if (this._listeners[type].some(e => e.callback === fn && e.capture === capture)) return;
+    if (capture) _anyCaptureListeners = true;
+    this._listeners[type].push({ callback: fn, capture });
   }
-  removeEventListener(type, fn) {
+  removeEventListener(type, fn, opts) {
     if (this._listeners?.[type]) {
-      this._listeners[type] = this._listeners[type].filter(h => h !== fn);
+      const capture = _eventCapture(opts);
+      this._listeners[type] = this._listeners[type]
+        .filter(e => !(e.callback === fn && e.capture === capture));
     }
   }
   dispatchEvent(event) {
     if (!event) return true;
+    // The document is reached here either as the event's own target or by the
+    // bubble path from a descendant; in the latter case its capture listeners
+    // already ran in `_runCapturePhase`.
+    const atTarget = !event.target || event.target === this;
     if (!event.target) event.target = this;
     event.currentTarget = this;
+    event.eventPhase = atTarget ? 2 : 3;
     // `document.onreadystatechange = fn` and its siblings are event handler
     // IDL attributes, so they run alongside addEventListener handlers.
     const handler = this['on' + event.type];
@@ -5749,9 +5835,15 @@ class Document extends Node {
         if (ret === false) event.preventDefault();
       } catch(e) { console.error('document event error:', e); }
     }
+    // At the target both capture and bubble listeners run, in registration order.
     const handlers = (this._listeners?.[event.type] || []).slice();
-    for (const h of handlers) { try { h.call(this, event); } catch(e) { console.error('document event error:', e); } }
+    for (const h of handlers) {
+      if (!atTarget && h.capture) continue;
+      try { h.callback.call(this, event); } catch(e) { console.error('document event error:', e); }
+      if (event._immediatePropagationStopped) break;
+    }
     event.currentTarget = null;
+    event.eventPhase = 0;
     return !event.defaultPrevented;
   }
   createTreeWalker(root, whatToShow, filter) {

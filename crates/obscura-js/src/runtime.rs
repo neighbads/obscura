@@ -4396,6 +4396,75 @@ mod tests {
         );
     }
 
+    // DOM dispatch runs the ancestors' capture listeners, outermost first,
+    // before the target's own. `load` does not bubble, so that phase is the
+    // only way a document-wide or window-wide listener ever sees it.
+    #[test]
+    fn element_events_run_the_ancestor_capture_phase() {
+        let mut rt = setup_runtime(
+            "<html><body><div id='outer'><img id='i'></div></body></html>",
+        );
+        assert_eq!(
+            rt.evaluate(
+                "(function() {
+                   const log = [];
+                   const img = document.getElementById('i');
+                   const outer = document.getElementById('outer');
+                   window.addEventListener('load', e => log.push('win-capture:' + e.eventPhase), true);
+                   window.addEventListener('load', () => log.push('win-bubble'));
+                   document.addEventListener('load', e => log.push(
+                       'doc-capture:' + e.eventPhase + ':' + (e.target === img)), true);
+                   document.addEventListener('load', () => log.push('doc-bubble'));
+                   outer.addEventListener('load', e => log.push('outer-capture:' + e.eventPhase), true);
+                   outer.addEventListener('load', () => log.push('outer-bubble'));
+                   img.addEventListener('load', e => log.push('target:' + e.eventPhase));
+                   img.dispatchEvent(new Event('load'));
+                   return log;
+                 })()"
+            )
+            .unwrap(),
+            serde_json::json!([
+                "win-capture:1",
+                "doc-capture:1:true",
+                "outer-capture:1",
+                "target:2",
+            ]),
+            "a non-bubbling element event reaches every ancestor capture listener \
+             and no bubble listener"
+        );
+    }
+
+    // A capture listener sits on one event path position, so a bubbling event
+    // must not deliver to it twice.
+    #[test]
+    fn capture_listeners_receive_a_bubbling_event_once() {
+        let mut rt = setup_runtime(
+            "<html><body><div id='outer'><span id='inner'></span></div></body></html>",
+        );
+        assert_eq!(
+            rt.evaluate(
+                "(function() {
+                   const log = [];
+                   document.addEventListener('ping', () => log.push('doc-capture'), true);
+                   document.addEventListener('ping', () => log.push('doc-bubble'));
+                   const outer = document.getElementById('outer');
+                   outer.addEventListener('ping', () => log.push('outer-capture'), true);
+                   outer.addEventListener('ping', () => log.push('outer-bubble'));
+                   document.getElementById('inner')
+                       .dispatchEvent(new Event('ping', { bubbles: true }));
+                   return log;
+                 })()"
+            )
+            .unwrap(),
+            serde_json::json!([
+                "doc-capture",
+                "outer-capture",
+                "outer-bubble",
+                "doc-bubble",
+            ]),
+        );
+    }
+
     // An event handler content attribute is compiled into the element's event
     // handler, so the matching IDL attribute must read back as a function
     // (HTML "event handler content attributes").

@@ -6277,7 +6277,12 @@ class HTMLImageElement extends HTMLElement {
     this._queueImageRequest();
     return this._imageNaturalHeight;
   }
-  get onload() { return this._imageOnload || null; }
+  // Until script assigns one, the event handler is whatever the `onload` /
+  // `onerror` content attribute compiled to.
+  get onload() {
+    if (this._imageOnload !== undefined) return this._imageOnload;
+    return this._resolveInlineHandler("onload");
+  }
   set onload(value) {
     this._imageOnload = typeof value === "function" ? value : null;
     if (this._imageOnload) {
@@ -6285,7 +6290,10 @@ class HTMLImageElement extends HTMLElement {
       this._queueImageRequest();
     }
   }
-  get onerror() { return this._imageOnerror || null; }
+  get onerror() {
+    if (this._imageOnerror !== undefined) return this._imageOnerror;
+    return this._resolveInlineHandler("onerror");
+  }
   set onerror(value) {
     this._imageOnerror = typeof value === "function" ? value : null;
     if (this._imageOnerror) {
@@ -6881,7 +6889,12 @@ Object.defineProperty(Element.prototype, 'onload', {
     if (_isWindowReflectingBodyElement(this)) {
       return globalThis.onload;
     }
-    return this.__onload || null;
+    // An event handler content attribute is compiled into the element's event
+    // handler, so the IDL attribute reads back as a function until script
+    // assigns over it. Reading `script.onload` on a parser-inserted
+    // `<script onload="...">` must not be null.
+    if (this.__onload !== undefined) return this.__onload;
+    return this._resolveInlineHandler('onload');
   },
   set(value) {
     if (_isWindowReflectingBodyElement(this)) {
@@ -6889,6 +6902,17 @@ Object.defineProperty(Element.prototype, 'onload', {
       return;
     }
     this.__onload = typeof value === 'function' ? value : null;
+  },
+  configurable: true,
+  enumerable: false,
+});
+Object.defineProperty(Element.prototype, 'onerror', {
+  get() {
+    if (this.__onerror !== undefined) return this.__onerror;
+    return this._resolveInlineHandler('onerror');
+  },
+  set(value) {
+    this.__onerror = typeof value === 'function' ? value : null;
   },
   configurable: true,
   enumerable: false,

@@ -4396,6 +4396,42 @@ mod tests {
         );
     }
 
+    // An event handler content attribute is compiled into the element's event
+    // handler, so the matching IDL attribute must read back as a function
+    // (HTML "event handler content attributes").
+    #[test]
+    fn event_handler_content_attributes_reflect_as_functions() {
+        let mut rt = setup_runtime(
+            "<html><body><script id='s' src='a.js' onload='globalThis.__x=1'></script>\
+             <img id='i' src='a.png' onerror='globalThis.__y=1'></body></html>",
+        );
+        assert_eq!(
+            rt.evaluate(
+                "[typeof document.getElementById('s').onload,\
+                  typeof document.getElementById('i').onerror,\
+                  typeof document.getElementById('s').onerror,\
+                  typeof document.getElementById('i').onload]"
+            )
+            .unwrap(),
+            serde_json::json!(["function", "function", "object", "object"]),
+            "the compiled handler must come from the content attribute, and an \
+             element without one must not gain a handler"
+        );
+        assert_eq!(
+            rt.evaluate(
+                "(function() {\
+                   document.getElementById('s').onload = null;\
+                   document.getElementById('i').onerror = null;\
+                   return [typeof document.getElementById('s').onload,\
+                           typeof document.getElementById('i').onerror];\
+                 })()"
+            )
+            .unwrap(),
+            serde_json::json!(["object", "object"]),
+            "an explicit IDL assignment replaces the content attribute handler"
+        );
+    }
+
     #[cfg(feature = "render")]
     #[test]
     fn page_transport_keeps_render_resources_cache_only_across_document_resets() {

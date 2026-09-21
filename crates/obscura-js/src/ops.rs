@@ -668,7 +668,7 @@ impl RealmStates {
         self.entries.retain(|(known, _, _)| known != context);
     }
 
-    fn by_frame_id(&self, frame_id: u32) -> Option<SharedState> {
+    pub(crate) fn by_frame_id(&self, frame_id: u32) -> Option<SharedState> {
         self.entries
             .iter()
             .find(|(_, id, _)| *id == frame_id)

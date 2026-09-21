@@ -178,6 +178,12 @@ impl FrameRealm {
     }
 
     /// Sets the frame document's viewport before any of its scripts run.
+    ///
+    /// Both surfaces, because they answer the same question: the JS globals a
+    /// frame script reads, and the viewport its own layout resolves `100%`,
+    /// `vw` and media queries against. Leaving the native half at the default
+    /// laid a frame document out at the page's width, so everything inside a
+    /// narrow iframe came out page-sized.
     pub fn set_viewport(
         &self,
         parent: &mut ObscuraJsRuntime,
@@ -194,6 +200,15 @@ impl FrameRealm {
         } else {
             150.0
         };
+        // Nothing to invalidate: this runs once, right after the realm is
+        // built, before any of the frame's own script or layout has happened.
+        #[cfg(feature = "render")]
+        {
+            let state = self.realms.borrow().by_frame_id(self.frame_id);
+            if let Some(state) = state {
+                state.borrow_mut().viewport = (width as f32, height as f32);
+            }
+        }
         self.execute_script(
             parent,
             &format!(
@@ -708,6 +723,54 @@ mod tests {
                 )
                 .unwrap(),
             serde_json::json!([300, 65, 300, 65]),
+        );
+    }
+
+    /// The frame's own layout must resolve against the iframe's box too, not
+    /// just its JS globals. The native viewport stayed at the 1280x720 default,
+    /// so a `width:100%` element inside a 300px-wide iframe was laid out 1280px
+    /// wide and every viewport-relative length and wrapping point with it.
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn frame_lays_out_against_its_embedding_viewport() {
+        let mut parent = page(
+            "https://parent.example/page",
+            "<html><head><style>body{margin:0}</style></head>\
+             <body><iframe style='width:300px;height:200px'></iframe>\
+             <div id='p' style='width:100%;height:10px'></div></body></html>",
+        );
+        let frame = FrameRealm::new(
+            &mut parent,
+            1,
+            0,
+            "https://child.example/frame",
+            "<html><head><style>body{margin:0}</style></head>\
+             <body><div id='full' style='width:100%;height:10px'></div>\
+             <div id='half' style='width:50vw;height:10vh'></div></body></html>",
+        )
+        .expect("frame realm");
+
+        frame.set_viewport(&mut parent, 300.0, 200.0).unwrap();
+        assert_eq!(
+            frame
+                .evaluate(
+                    &mut parent,
+                    "(() => {\
+                       const full = document.getElementById('full').getBoundingClientRect();\
+                       const half = document.getElementById('half').getBoundingClientRect();\
+                       return [full.width, half.width, half.height];\
+                     })()",
+                )
+                .unwrap(),
+            serde_json::json!([300, 150, 20]),
+        );
+
+        // The page keeps laying out against its own viewport.
+        assert_eq!(
+            parent
+                .evaluate("document.getElementById('p').getBoundingClientRect().width")
+                .unwrap(),
+            serde_json::json!(1280.0),
         );
     }
 

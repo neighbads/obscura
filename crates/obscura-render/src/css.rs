@@ -7461,6 +7461,45 @@ fn split_media_query_list(query: &str) -> Vec<&str> {
 mod tests {
     use super::*;
 
+    /// The retained document scan skips re-collecting and re-comparing the
+    /// author sources, so `reuse_retained` is the only thing standing between
+    /// it and a stale sheet. It must accept a parse only while the single
+    /// cache entry still *is* that parse, at the same viewport and media type.
+    #[test]
+    fn reuse_retained_only_accepts_the_live_cache_entry() {
+        let tree = obscura_dom::parse_html("<html><body></body></html>");
+        let viewport = (800.0, 600.0);
+        let mut cache = StylesheetCache::default();
+        let retained = Arc::new(Stylesheet::parse(&tree, &[".a{color:red}".to_string()]));
+        assert!(
+            !cache.reuse_retained(&retained, viewport, CssMediaType::Screen),
+            "an empty cache retains nothing"
+        );
+
+        let (sheet, hit) = cache.get_or_parse(
+            &tree,
+            &[".a{color:red}".to_string()],
+            viewport,
+            CssMediaType::Screen,
+        );
+        assert!(!hit);
+        assert!(cache.reuse_retained(&sheet, viewport, CssMediaType::Screen));
+        assert!(!cache.reuse_retained(&sheet, (400.0, 600.0), CssMediaType::Screen));
+        assert!(!cache.reuse_retained(&sheet, viewport, CssMediaType::Print));
+
+        // The cache holds one entry: another document's parse evicts this one.
+        cache.get_or_parse(
+            &tree,
+            &[".b{color:blue}".to_string()],
+            viewport,
+            CssMediaType::Screen,
+        );
+        assert!(
+            !cache.reuse_retained(&sheet, viewport, CssMediaType::Screen),
+            "a replaced cache entry must not be reported as a hit"
+        );
+    }
+
     fn test_invalidation_map(css: &str) -> InvalidationMap {
         let tree = obscura_dom::parse_html("<html><body></body></html>");
         Stylesheet::parse(&tree, &[css.to_string()])

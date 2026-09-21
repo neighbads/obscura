@@ -145,6 +145,11 @@ pub struct RenderResourceCache {
     max_content_image_intrinsics: usize,
     #[cfg(test)]
     content_image_layout_retries: usize,
+    /// How many rebuilds reused the previous whole-document scans instead of
+    /// walking the document again. Test-only: the reuse is otherwise invisible
+    /// by design, because a reused scan must produce identical output.
+    #[cfg(test)]
+    document_scan_reuses: usize,
     sync_loading_enabled: bool,
     /// Resources a cache-only lookup missed since the last `take_sync_misses`,
     /// with the request identity layout used (image CORS profile or none) and
@@ -190,6 +195,8 @@ impl RenderResourceCache {
             max_content_image_intrinsics: max_entries.min(DEFAULT_CONTENT_IMAGE_INTRINSIC_ENTRIES),
             #[cfg(test)]
             content_image_layout_retries: 0,
+            #[cfg(test)]
+            document_scan_reuses: 0,
             sync_loading_enabled: true,
             sync_misses: Vec::new(),
             sync_miss_keys: HashSet::new(),
@@ -2688,7 +2695,13 @@ fn prepare_dom_with_dynamic_fonts_and_stylesheet_cache_internal(
     // and never paint). This seeds the same cache the paint pass reads, so
     // each URL is still fetched at most once.
     let prepare_scan = match reused_prepare_scan {
-        Some(scan) => scan,
+        Some(scan) => {
+            #[cfg(test)]
+            {
+                resources.document_scan_reuses += 1;
+            }
+            scan
+        }
         None => PrepareScan {
             image_selections: collect_image_selections(tree, viewport, base_url),
             font_rules_and_preloads: collect_web_font_rules(tree, base_url, dynamic_fonts),
@@ -18134,4 +18147,565 @@ mod tests {
         assert!(!at_end.has_active_css_animations());
     }
 
+    // --- Retained whole-document scan reuse -------------------------------
+    //
+    // A rebuild whose only damage is an inline `style` attribute reuses the
+    // previous document scans (image selection, font-face rules, inline SVG
+    // text, author sources, DOM-text emoji). Each test below drives one input
+    // that must defeat that reuse, and asserts both the reuse counter and the
+    // rendered result, so removing an invalidation condition fails the test on
+    // stale output and not merely on a counter.
+
+    fn style_damage(node: obscura_dom::tree::NodeId) -> Vec<crate::dom::RetainedStyleMutation> {
+        vec![crate::dom::RetainedStyleMutation::Attribute(
+            crate::dom::AttributeStyleMutation {
+                node,
+                name: "style".to_string(),
+                old_value: None,
+                new_value: None,
+            },
+        )]
+    }
+
+    fn svg_bytes(width: u32, height: u32) -> Vec<u8> {
+        format!(
+            r##"<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}"><rect width="{width}" height="{height}" fill="#f00"/></svg>"##
+        )
+        .into_bytes()
+    }
+
+    #[test]
+    fn inline_style_damage_reuses_the_previous_document_scan() {
+        let tree = parse_html(
+            r#"<html><head><style>.row{height:5px}</style></head>
+               <body id="body"><div class="row"></div></body></html>"#,
+        );
+        let body = tree.get_element_by_id("body").unwrap();
+        let mut resources = RenderResourceCache::with_loader(|_url: &str| None);
+        let mut stylesheets = crate::css::StylesheetCache::default();
+        let first = prepare_dom_with_dynamic_fonts_and_stylesheet_cache(
+            &tree,
+            (200.0, 200.0),
+            None,
+            &mut resources,
+            &[],
+            &mut stylesheets,
+        )
+        .expect("first render");
+        assert_eq!(resources.document_scan_reuses, 0);
+
+        tree.with_node_mut(body, |node| {
+            node.set_attribute("style", "padding-top:7px".to_string())
+        });
+        let second = prepare_dom_with_retained_styles(
+            &tree,
+            (200.0, 200.0),
+            None,
+            &mut resources,
+            &[],
+            &mut stylesheets,
+            first,
+            &style_damage(body),
+        )
+        .expect("retained render");
+        assert_eq!(
+            resources.document_scan_reuses, 1,
+            "inline style damage must reuse the document scan"
+        );
+        // The reuse must not cost correctness: the style write still applies.
+        let row = tree.query_selector(".row").unwrap().unwrap();
+        assert_eq!(second.layout.rects[&row].y, 8.0 + 7.0);
+    }
+
+    #[test]
+    fn style_element_text_damage_rebuilds_the_document_scan() {
+        let tree = parse_html(
+            r#"<html><head><style id="sheet">.row{height:5px}</style></head>
+               <body id="body"><div class="row"></div></body></html>"#,
+        );
+        let body = tree.get_element_by_id("body").unwrap();
+        let sheet = tree.get_element_by_id("sheet").unwrap();
+        let mut resources = RenderResourceCache::with_loader(|_url: &str| None);
+        let mut stylesheets = crate::css::StylesheetCache::default();
+        let first = prepare_dom_with_dynamic_fonts_and_stylesheet_cache(
+            &tree,
+            (200.0, 200.0),
+            None,
+            &mut resources,
+            &[],
+            &mut stylesheets,
+        )
+        .expect("first render");
+
+        let text = tree.children(sheet)[0];
+        tree.with_node_mut(text, |node| {
+            node.data = obscura_dom::tree::NodeData::Text {
+                contents: ".row{height:41px}".to_string(),
+            }
+        });
+        let mut mutations = style_damage(body);
+        mutations.push(crate::dom::RetainedStyleMutation::Tree(
+            crate::dom::TreeStyleMutation::Text {
+                node: text,
+                parent: Some(sheet),
+            },
+        ));
+        let second = prepare_dom_with_retained_styles(
+            &tree,
+            (200.0, 200.0),
+            None,
+            &mut resources,
+            &[],
+            &mut stylesheets,
+            first,
+            &mutations,
+        )
+        .expect("retained render");
+        assert_eq!(resources.document_scan_reuses, 0);
+        let row = tree.query_selector(".row").unwrap().unwrap();
+        assert_eq!(
+            second.layout.rects[&row].height, 41.0,
+            "an edited <style> must re-enter the author sources"
+        );
+    }
+
+    #[test]
+    fn image_source_damage_rebuilds_the_document_scan() {
+        let tree = parse_html(
+            r#"<html><body id="body"><img id="hero" src="a.svg" style="display:block"></body></html>"#,
+        );
+        let body = tree.get_element_by_id("body").unwrap();
+        let hero = tree.get_element_by_id("hero").unwrap();
+        let mut resources = RenderResourceCache::with_loader(|_url: &str| None);
+        resources.seed_image(
+            "https://example.test/a.svg".to_string(),
+            ImageRequestProfile::NoCorsInclude,
+            svg_bytes(20, 10),
+        );
+        resources.seed_image(
+            "https://example.test/b.svg".to_string(),
+            ImageRequestProfile::NoCorsInclude,
+            svg_bytes(40, 30),
+        );
+        let mut stylesheets = crate::css::StylesheetCache::default();
+        let first = prepare_dom_with_dynamic_fonts_and_stylesheet_cache(
+            &tree,
+            (200.0, 200.0),
+            Some("https://example.test/page.html"),
+            &mut resources,
+            &[],
+            &mut stylesheets,
+        )
+        .expect("first render");
+        assert_eq!(first.layout.rects[&hero].width, 20.0);
+
+        tree.with_node_mut(hero, |node| node.set_attribute("src", "b.svg".to_string()));
+        let mut mutations = style_damage(body);
+        mutations.push(crate::dom::RetainedStyleMutation::Attribute(
+            crate::dom::AttributeStyleMutation {
+                node: hero,
+                name: "src".to_string(),
+                old_value: Some("a.svg".to_string()),
+                new_value: Some("b.svg".to_string()),
+            },
+        ));
+        let second = prepare_dom_with_retained_styles(
+            &tree,
+            (200.0, 200.0),
+            Some("https://example.test/page.html"),
+            &mut resources,
+            &[],
+            &mut stylesheets,
+            first,
+            &mutations,
+        )
+        .expect("retained render");
+        assert_eq!(resources.document_scan_reuses, 0);
+        assert_eq!(
+            second.layout.rects[&hero].width, 40.0,
+            "a changed src must reselect the image"
+        );
+    }
+
+    #[test]
+    fn attaching_a_shadow_root_rebuilds_the_document_scan() {
+        let tree = parse_html(
+            r#"<html><body id="body"><x-card id="host" style="display:block"><div id="light" style="height:9px"></div></x-card></body></html>"#,
+        );
+        let body = tree.get_element_by_id("body").unwrap();
+        let host = tree.get_element_by_id("host").unwrap();
+        let light = tree.get_element_by_id("light").unwrap();
+        let mut resources = RenderResourceCache::with_loader(|_url: &str| None);
+        let mut stylesheets = crate::css::StylesheetCache::default();
+        let first = prepare_dom_with_dynamic_fonts_and_stylesheet_cache(
+            &tree,
+            (200.0, 200.0),
+            None,
+            &mut resources,
+            &[],
+            &mut stylesheets,
+        )
+        .expect("first render");
+        assert!(first.layout.rects.contains_key(&light));
+
+        // `attachShadow` replaces the host's rendered children without
+        // producing any retained-style mutation of its own.
+        tree.attach_shadow_root(host, ShadowRootMode::Open)
+            .expect("attach shadow root");
+        let second = prepare_dom_with_retained_styles(
+            &tree,
+            (200.0, 200.0),
+            None,
+            &mut resources,
+            &[],
+            &mut stylesheets,
+            first,
+            &style_damage(body),
+        )
+        .expect("retained render");
+        assert_eq!(resources.document_scan_reuses, 0);
+        assert!(
+            !second.layout.rects.contains_key(&light),
+            "an unslotted light child must stop generating boxes"
+        );
+    }
+
+    #[test]
+    fn viewport_change_rebuilds_the_document_scan() {
+        let tree = parse_html(
+            r#"<html><head><style media="(min-width:400px)">.row{height:31px}</style></head>
+               <body id="body"><div class="row"></div></body></html>"#,
+        );
+        let body = tree.get_element_by_id("body").unwrap();
+        let mut resources = RenderResourceCache::with_loader(|_url: &str| None);
+        let mut stylesheets = crate::css::StylesheetCache::default();
+        let first = prepare_dom_with_dynamic_fonts_and_stylesheet_cache(
+            &tree,
+            (200.0, 200.0),
+            None,
+            &mut resources,
+            &[],
+            &mut stylesheets,
+        )
+        .expect("first render");
+        let row = tree.query_selector(".row").unwrap().unwrap();
+        assert_ne!(first.layout.rects[&row].height, 31.0);
+
+        let second = prepare_dom_with_retained_styles(
+            &tree,
+            (600.0, 200.0),
+            None,
+            &mut resources,
+            &[],
+            &mut stylesheets,
+            first,
+            &style_damage(body),
+        )
+        .expect("retained render");
+        assert_eq!(resources.document_scan_reuses, 0);
+        assert_eq!(
+            second.layout.rects[&row].height, 31.0,
+            "a wider viewport must re-evaluate the sheet's media query"
+        );
+    }
+
+    #[test]
+    fn resource_damage_rebuilds_the_document_scan() {
+        let tree = parse_html(
+            r#"<html><body id="body"><img id="hero" src="a.svg" style="display:block"></body></html>"#,
+        );
+        let mut resources = RenderResourceCache::with_loader(|_url: &str| None);
+        let mut stylesheets = crate::css::StylesheetCache::default();
+        let first = prepare_dom_with_dynamic_fonts_and_stylesheet_cache(
+            &tree,
+            (200.0, 200.0),
+            Some("https://example.test/page.html"),
+            &mut resources,
+            &[],
+            &mut stylesheets,
+        )
+        .expect("first render");
+
+        resources.seed_image(
+            "https://example.test/a.svg".to_string(),
+            ImageRequestProfile::NoCorsInclude,
+            svg_bytes(40, 30),
+        );
+        let second = prepare_dom_with_retained_styles(
+            &tree,
+            (200.0, 200.0),
+            Some("https://example.test/page.html"),
+            &mut resources,
+            &[],
+            &mut stylesheets,
+            first,
+            &[crate::dom::RetainedStyleMutation::Resource],
+        )
+        .expect("retained render");
+        assert_eq!(resources.document_scan_reuses, 0);
+        let hero = tree.get_element_by_id("hero").unwrap();
+        assert_eq!(second.layout.rects[&hero].width, 40.0);
+    }
+
+    /// Bytes can land without a `Resource` marker when the page decides the
+    /// new geometry cannot matter. The reused scan only remembers *which*
+    /// image each element selected, never its bytes, so the very next rebuild
+    /// still reads the fresh metadata.
+    #[test]
+    fn a_reused_scan_still_reads_newly_landed_image_bytes() {
+        let tree = parse_html(
+            r#"<html><body id="body"><img id="hero" src="a.svg" style="display:block"></body></html>"#,
+        );
+        let body = tree.get_element_by_id("body").unwrap();
+        let hero = tree.get_element_by_id("hero").unwrap();
+        let mut resources = RenderResourceCache::with_loader(|_url: &str| None);
+        let mut stylesheets = crate::css::StylesheetCache::default();
+        let first = prepare_dom_with_dynamic_fonts_and_stylesheet_cache(
+            &tree,
+            (200.0, 200.0),
+            Some("https://example.test/page.html"),
+            &mut resources,
+            &[],
+            &mut stylesheets,
+        )
+        .expect("first render");
+        assert_ne!(first.layout.rects[&hero].width, 40.0);
+
+        resources.seed_image(
+            "https://example.test/a.svg".to_string(),
+            ImageRequestProfile::NoCorsInclude,
+            svg_bytes(40, 30),
+        );
+        let second = prepare_dom_with_retained_styles(
+            &tree,
+            (200.0, 200.0),
+            Some("https://example.test/page.html"),
+            &mut resources,
+            &[],
+            &mut stylesheets,
+            first,
+            &style_damage(body),
+        )
+        .expect("retained render");
+        assert_eq!(resources.document_scan_reuses, 1);
+        assert_eq!(
+            second.layout.rects[&hero].width, 40.0,
+            "a reused scan must not freeze image metadata"
+        );
+    }
+
+    #[test]
+    fn dynamic_fonts_rebuild_the_document_scan() {
+        let tree = parse_html(r#"<html><body id="body">hi</body></html>"#);
+        let body = tree.get_element_by_id("body").unwrap();
+        let mut resources = RenderResourceCache::with_loader(|_url: &str| None);
+        let mut stylesheets = crate::css::StylesheetCache::default();
+        let first = prepare_dom_with_dynamic_fonts_and_stylesheet_cache(
+            &tree,
+            (200.0, 200.0),
+            None,
+            &mut resources,
+            &[],
+            &mut stylesheets,
+        )
+        .expect("first render");
+
+        let faces = [DynamicFontFace {
+            family: "Scripted".to_string(),
+            source: "url(scripted.woff2)".to_string(),
+            style: "normal".to_string(),
+            weight: "400".to_string(),
+            unicode_range: "U+0-10FFFF".to_string(),
+        }];
+        prepare_dom_with_retained_styles(
+            &tree,
+            (200.0, 200.0),
+            None,
+            &mut resources,
+            &faces,
+            &mut stylesheets,
+            first,
+            &style_damage(body),
+        )
+        .expect("retained render");
+        assert_eq!(
+            resources.document_scan_reuses, 0,
+            "a script-registered face must re-derive the font rules"
+        );
+    }
+
+    /// The emoji decision is split: the DOM-text half is reused, the
+    /// generated-content half is recomputed from the live styles every
+    /// rebuild, because an inline custom property can reach `content` through
+    /// `var()`.
+    #[test]
+    fn generated_content_emoji_survives_a_reused_document_scan() {
+        let markup = |value: &str| {
+            format!(
+                r#"<html><head><style>#tag::before{{content:var(--mark)}}</style></head>
+                   <body id="body"><span id="tag" style="{value}"></span></body></html>"#
+            )
+        };
+        let tree = parse_html(&markup(""));
+        let body = tree.get_element_by_id("body").unwrap();
+        let tag = tree.get_element_by_id("tag").unwrap();
+        let mut resources = RenderResourceCache::with_loader(|_url: &str| None);
+        let mut stylesheets = crate::css::StylesheetCache::default();
+        let first = prepare_dom_with_dynamic_fonts_and_stylesheet_cache(
+            &tree,
+            (200.0, 200.0),
+            None,
+            &mut resources,
+            &[],
+            &mut stylesheets,
+        )
+        .expect("first render");
+
+        tree.with_node_mut(tag, |node| {
+            node.set_attribute("style", "--mark:\"\u{1f389}\"".to_string())
+        });
+        let retained = prepare_dom_with_retained_styles(
+            &tree,
+            (200.0, 200.0),
+            None,
+            &mut resources,
+            &[],
+            &mut stylesheets,
+            first,
+            &style_damage(tag),
+        )
+        .expect("retained render");
+        assert_eq!(resources.document_scan_reuses, 1);
+
+        let fresh_tree = parse_html(&markup("--mark:\"\u{1f389}\""));
+        let mut fresh_resources = RenderResourceCache::with_loader(|_url: &str| None);
+        let mut fresh_stylesheets = crate::css::StylesheetCache::default();
+        let fresh = prepare_dom_with_dynamic_fonts_and_stylesheet_cache(
+            &fresh_tree,
+            (200.0, 200.0),
+            None,
+            &mut fresh_resources,
+            &[],
+            &mut fresh_stylesheets,
+        )
+        .expect("fresh render");
+        assert_eq!(
+            retained.layout.generated_boxes.len(),
+            fresh.layout.generated_boxes.len()
+        );
+        for (retained_box, fresh_box) in retained
+            .layout
+            .generated_boxes
+            .iter()
+            .zip(&fresh.layout.generated_boxes)
+        {
+            assert_eq!(
+                (retained_box.rect.width, retained_box.rect.height),
+                (fresh_box.rect.width, fresh_box.rect.height),
+                "a retained rebuild must shape generated emoji like a full rebuild"
+            );
+        }
+        let _ = body;
+    }
+
+    #[test]
+    fn inline_svg_text_insertion_rebuilds_the_document_scan() {
+        let tree = parse_html(
+            r#"<html><body id="body"><svg id="art" width="40" height="20"><text id="label">hi</text></svg></body></html>"#,
+        );
+        let body = tree.get_element_by_id("body").unwrap();
+        let art = tree.get_element_by_id("art").unwrap();
+        // Start without the SVG text so the first scan records `false`.
+        let text = tree.get_element_by_id("label").unwrap();
+        tree.detach(text);
+        let mut resources = RenderResourceCache::with_loader(|_url: &str| None);
+        let mut stylesheets = crate::css::StylesheetCache::default();
+        let first = prepare_dom_with_dynamic_fonts_and_stylesheet_cache(
+            &tree,
+            (200.0, 200.0),
+            None,
+            &mut resources,
+            &[],
+            &mut stylesheets,
+        )
+        .expect("first render");
+
+        tree.append_child(art, text);
+        let mut mutations = style_damage(body);
+        mutations.push(crate::dom::RetainedStyleMutation::Tree(
+            crate::dom::TreeStyleMutation::Insert {
+                node: text,
+                old_parent: None,
+                new_parent: art,
+            },
+        ));
+        prepare_dom_with_retained_styles(
+            &tree,
+            (200.0, 200.0),
+            None,
+            &mut resources,
+            &[],
+            &mut stylesheets,
+            first,
+            &mutations,
+        )
+        .expect("retained render");
+        assert_eq!(
+            resources.document_scan_reuses, 0,
+            "new inline SVG text must re-derive the SVG font database"
+        );
+    }
+
+    #[test]
+    fn link_media_damage_rebuilds_the_document_scan() {
+        let tree = parse_html(
+            r#"<html><head><link id="sheet" rel="stylesheet" media="print" href="a.css"></head>
+               <body id="body"><div class="row"></div></body></html>"#,
+        );
+        let body = tree.get_element_by_id("body").unwrap();
+        let sheet = tree.get_element_by_id("sheet").unwrap();
+        tree.replace_external_stylesheet(sheet, ".row{height:23px}".to_string(), true);
+        let mut resources = RenderResourceCache::with_loader(|_url: &str| None);
+        let mut stylesheets = crate::css::StylesheetCache::default();
+        let first = prepare_dom_with_dynamic_fonts_and_stylesheet_cache(
+            &tree,
+            (200.0, 200.0),
+            None,
+            &mut resources,
+            &[],
+            &mut stylesheets,
+        )
+        .expect("first render");
+        let row = tree.query_selector(".row").unwrap().unwrap();
+        assert_ne!(first.layout.rects[&row].height, 23.0);
+
+        tree.with_node_mut(sheet, |node| {
+            node.set_attribute("media", "screen".to_string())
+        });
+        let mut mutations = style_damage(body);
+        mutations.push(crate::dom::RetainedStyleMutation::Attribute(
+            crate::dom::AttributeStyleMutation {
+                node: sheet,
+                name: "media".to_string(),
+                old_value: Some("print".to_string()),
+                new_value: Some("screen".to_string()),
+            },
+        ));
+        let second = prepare_dom_with_retained_styles(
+            &tree,
+            (200.0, 200.0),
+            None,
+            &mut resources,
+            &[],
+            &mut stylesheets,
+            first,
+            &mutations,
+        )
+        .expect("retained render");
+        assert_eq!(resources.document_scan_reuses, 0);
+        assert_eq!(
+            second.layout.rects[&row].height, 23.0,
+            "a newly matching media attribute must re-enter the author sources"
+        );
+    }
 }

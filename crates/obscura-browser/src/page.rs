@@ -990,9 +990,15 @@ fn parse_import_url(stmt: &str) -> Option<StylesheetImport> {
     })
 }
 
-/// Attach CSSOM state and dispatch load for a host-fetched linked sheet.
-/// Fetched bytes live in native DOM state, never in a synthetic `<style>` that
-/// page script could read.
+/// Attach CSSOM state for a host-fetched linked sheet and arm its `load`
+/// event. Fetched bytes live in native DOM state, never in a synthetic
+/// `<style>` that page script could read.
+///
+/// Registration has to precede page script so `document.styleSheets` is
+/// populated, but the event must not: a sheet's `load` handler is page code
+/// and runs after the scripts that define what it calls. The event is armed
+/// here and fired by `dispatch_linked_stylesheet_loads_script` at the link's
+/// own position in document order.
 fn register_linked_stylesheet_script(link_index: usize, response_url: &str) -> String {
     let response_url = serde_json::to_string(response_url).unwrap_or_else(|_| "null".to_string());
     format!(
@@ -1014,8 +1020,29 @@ fn register_linked_stylesheet_script(link_index: usize, response_url: &str) -> S
 
             syncSheet();
             globalThis.__obscura_registerLinkedStylesheet(link, {response_url});
-            try {{ link.dispatchEvent(new Event('load')); }}
-            finally {{ syncSheet(); }}
+            link.__obscuraFireSheetLoad = function() {{
+                try {{ link.dispatchEvent(new Event('load')); }}
+                finally {{ syncSheet(); }}
+            }};
+        }})()"#
+    )
+}
+
+/// Fire the armed `load` event of the given stylesheet links, in the order
+/// given. Indices address `link[rel~="stylesheet"]` in document order, the
+/// same space `linked_stylesheet_requests` uses.
+fn dispatch_linked_stylesheet_loads_script(link_indices: &[usize]) -> String {
+    format!(
+        r#"(function() {{
+            var links = document.querySelectorAll('link[rel~="stylesheet"]');
+            var indices = {link_indices:?};
+            for (var i = 0; i < indices.length; i++) {{
+                var link = links[indices[i]];
+                if (!link || typeof link.__obscuraFireSheetLoad !== 'function') continue;
+                var fire = link.__obscuraFireSheetLoad;
+                link.__obscuraFireSheetLoad = null;
+                try {{ fire(); }} catch (e) {{}}
+            }}
         }})()"#
     )
 }
@@ -2342,6 +2369,40 @@ impl Page {
             None => return,
         };
 
+        // Document-order position of every stylesheet link, expressed as the
+        // number of parser scripts that precede it. A link's `load` event
+        // belongs at that position: the scripts before it have run and defined
+        // what its handler calls, the ones after it have not.
+        let stylesheet_link_offsets: Vec<usize> = match &self.js {
+            Some(js) => js
+                .with_dom(|dom| {
+                    let link_ids = dom
+                        .query_selector_all(r#"link[rel~="stylesheet"]"#)
+                        .unwrap_or_default();
+                    let link_order: std::collections::HashMap<u32, usize> = link_ids
+                        .iter()
+                        .enumerate()
+                        .map(|(index, id)| (id.raw(), index))
+                        .collect();
+                    let script_nids: std::collections::HashSet<u32> =
+                        all_scripts.iter().map(|script| script.nid).collect();
+                    let mut offsets = vec![0usize; link_ids.len()];
+                    let mut scripts_seen = 0usize;
+                    for nid in dom.descendants(dom.document()) {
+                        let raw = nid.raw();
+                        if script_nids.contains(&raw) {
+                            scripts_seen += 1;
+                        } else if let Some(&index) = link_order.get(&raw) {
+                            offsets[index] = scripts_seen;
+                        }
+                    }
+                    offsets
+                })
+                .unwrap_or_default(),
+            None => Vec::new(),
+        };
+        let mut stylesheet_loads_fired = vec![false; stylesheet_link_offsets.len()];
+
         // HTML scripts have an "already started" flag. Mark every
         // parser-discovered script before running page code so React/Next
         // hydration can move or hoist those nodes without appendChild
@@ -2681,7 +2742,33 @@ impl Page {
         // Process parser-discovered scripts in encounter order. Import maps
         // register at their exact position; module graphs start there too, but
         // evaluation of non-async modules remains post-parse.
+        // Fire the `load` of every stylesheet link that precedes the parser
+        // script about to run (`usize::MAX` drains the rest).
+        let mut flush_stylesheet_loads = |page: &mut Self, before_script: usize| {
+            let due: Vec<usize> = stylesheet_loads_fired
+                .iter()
+                .enumerate()
+                .filter(|(index, fired)| {
+                    !**fired && stylesheet_link_offsets[*index] <= before_script
+                })
+                .map(|(index, _)| index)
+                .collect();
+            if due.is_empty() {
+                return;
+            }
+            for index in &due {
+                stylesheet_loads_fired[*index] = true;
+            }
+            if let Some(js) = &mut page.js {
+                let _ = js.execute_script(
+                    "<stylesheet-load-events>",
+                    &dispatch_linked_stylesheet_loads_script(&due),
+                );
+            }
+        };
+
         for (index, script) in all_scripts.iter().enumerate() {
+            flush_stylesheet_loads(self, index);
             if tokio::time::Instant::now() >= script_deadline {
                 tracing::warn!(
                     "execute_scripts: deadline reached, skipping {} remaining scripts",
@@ -2868,6 +2955,10 @@ impl Page {
                 }
             }
         }
+
+        // Links after the last parser script still load before the document
+        // finishes parsing.
+        flush_stylesheet_loads(self, usize::MAX);
 
         // Parsing has finished before defer scripts and non-async modules run.
         // They still gate DOMContentLoaded, but observe the browser's
@@ -4886,7 +4977,8 @@ mod tests {
         css_resource_urls, linked_stylesheet_requests, materialize_stylesheet_graph,
         navigation_chain_limit_from_env_value, navigation_referrer,
         navigation_timeout_from_env_value, parse_import_url, rebase_css_urls,
-        register_linked_stylesheet_script, script_response_is_executable, split_css_imports,
+        dispatch_linked_stylesheet_loads_script, register_linked_stylesheet_script,
+        script_response_is_executable, split_css_imports,
         stylesheet_graph_is_origin_clean, truncate_on_char_boundary, url_matches_cdp_pattern,
         LoadedStylesheet, PendingFrameWork, StylesheetImport, DEFAULT_NAVIGATION_CHAIN_LIMIT,
     };
@@ -4916,6 +5008,14 @@ mod tests {
                 &register_linked_stylesheet_script(index, response_url),
             )
             .expect("register linked sheet");
+        // The navigation path fires this from the script phase; these tests
+        // have no script phase.
+        runtime
+            .execute_script(
+                "<linked-sheet-load>",
+                &dispatch_linked_stylesheet_loads_script(&[index]),
+            )
+            .expect("fire linked sheet load");
     }
 
     #[test]
@@ -7138,6 +7238,48 @@ mod tests {
             }
         });
         format!("http://{address}")
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn linked_stylesheet_load_runs_at_its_document_position() {
+        let html = r#"<html><head>
+            <script>
+                globalThis.__order = [];
+                globalThis.note = value => globalThis.__order.push(value);
+                note('first-script');
+            </script>
+            <link rel="stylesheet" href="a.css" onload="note('sheet-load')">
+            <script>note('second-script');</script>
+            </head><body></body></html>"#;
+        let mut page = import_map_test_page("sheet-load-order", "http://127.0.0.1:9", html);
+
+        // The navigation path installs fetched sheets before any script runs.
+        page.js
+            .as_mut()
+            .unwrap()
+            .with_dom(|dom| {
+                let links = dom
+                    .query_selector_all(r#"link[rel~="stylesheet"]"#)
+                    .expect("valid selector");
+                dom.replace_external_stylesheet(links[0], ".a{color:red}".to_string(), true)
+            })
+            .expect("live DOM");
+        page.js
+            .as_mut()
+            .unwrap()
+            .execute_script(
+                "<linked-sheet>",
+                &register_linked_stylesheet_script(0, "http://127.0.0.1:9/a.css"),
+            )
+            .expect("register linked sheet");
+
+        page.execute_scripts().await;
+
+        assert_eq!(
+            page.js.as_mut().unwrap().evaluate("globalThis.__order").unwrap(),
+            serde_json::json!(["first-script", "sheet-load", "second-script"]),
+            "a sheet's load handler runs after the scripts that precede the link",
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

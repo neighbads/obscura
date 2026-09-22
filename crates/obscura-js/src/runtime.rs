@@ -22484,4 +22484,99 @@ mod tests {
             .unwrap();
         assert_eq!(out, serde_json::json!(true));
     }
+
+    // ---- querySelector/querySelectorAll/matches/closest throw SyntaxError
+    // ---- on an invalid selector instead of silently returning empty (R-52)
+    // DOM 4.2.6: scope-match / match a selector against an element both run
+    // "parse a selector" first and must throw a SyntaxError on failure.
+
+    #[test]
+    fn query_selector_all_throws_syntax_error_for_invalid_selector() {
+        let mut rt = setup_runtime("<html><body><div id='dst'></div></body></html>");
+        let out = rt
+            .evaluate(
+                "(function(){var d=document.getElementById('dst');var threw=false,name=null;\
+                 try{d.querySelectorAll('[');}catch(e){threw=true;name=e.name;}\
+                 return [threw,name].join(',');})()",
+            )
+            .unwrap();
+        assert_eq!(out, serde_json::json!("true,SyntaxError"));
+    }
+
+    #[test]
+    fn query_selector_matches_closest_throw_syntax_error_for_invalid_selector() {
+        let mut rt = setup_runtime(
+            "<html><body><div id='dst'><span></span></div></body></html>",
+        );
+        let out = rt
+            .evaluate(
+                "(function(){var d=document.getElementById('dst');var span=d.firstElementChild;\
+                 var results=[];\
+                 function check(fn){try{fn();results.push('no-throw');}catch(e){results.push(e.name);}}\
+                 check(function(){document.querySelector('[');});\
+                 check(function(){document.querySelectorAll('[');});\
+                 check(function(){d.querySelector('[');});\
+                 check(function(){span.matches('[');});\
+                 check(function(){span.closest('[');});\
+                 return results.join(',');})()",
+            )
+            .unwrap();
+        assert_eq!(
+            out,
+            serde_json::json!(
+                "SyntaxError,SyntaxError,SyntaxError,SyntaxError,SyntaxError"
+            ),
+            "an unparsable selector must throw from every entry point that parses a selector"
+        );
+    }
+
+    #[test]
+    fn query_selector_all_still_returns_matches_for_valid_selectors() {
+        // The SyntaxError path must not regress the ordinary success path.
+        let mut rt = setup_runtime(
+            "<html><body><div id='dst'><span class='a'></span><span class='b'></span></div></body></html>",
+        );
+        let out = rt
+            .evaluate(
+                "(function(){var d=document.getElementById('dst');\
+                 return [d.querySelectorAll('span').length,\
+                 d.querySelector('.b')!==null,\
+                 d.firstElementChild.matches('span.a'),\
+                 d.querySelector('.b').closest('#dst')===d].join(',');})()",
+            )
+            .unwrap();
+        assert_eq!(out, serde_json::json!("2,true,true,true"));
+    }
+
+    #[test]
+    fn query_selector_matches_closest_do_not_throw_for_valid_but_unimplemented_selectors() {
+        // `:target` is syntactically valid Selectors grammar that this
+        // engine's selector parser does not implement. Real browsers accept
+        // it and return an empty/false result, so this must not throw
+        // SyntaxError — DOM §4.2.6 only mandates SyntaxError for a selector
+        // that fails to parse as grammar, not for one that parses fine but
+        // names an unimplemented feature. Throwing here would be a fidelity
+        // regression relative to Chromium, not spec conformance.
+        let mut rt = setup_runtime(
+            "<html><body><div id='dst'><span></span></div></body></html>",
+        );
+        let out = rt
+            .evaluate(
+                "(function(){var d=document.getElementById('dst');var span=d.firstElementChild;\
+                 var results=[];\
+                 function check(fn){try{results.push(String(fn()));}catch(e){results.push('threw:'+e.name);}}\
+                 check(function(){return document.querySelectorAll(':target').length;});\
+                 check(function(){return document.querySelector(':target');});\
+                 check(function(){return d.querySelectorAll(':target').length;});\
+                 check(function(){return span.matches(':target');});\
+                 check(function(){return span.closest(':target');});\
+                 return results.join(',');})()",
+            )
+            .unwrap();
+        assert_eq!(
+            out,
+            serde_json::json!("0,null,0,false,null"),
+            "a valid selector referencing an unimplemented pseudo-class must return empty/false, not throw"
+        );
+    }
 }

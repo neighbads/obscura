@@ -10,6 +10,7 @@ use deno_core::JsBuffer;
 use deno_core::v8;
 use deno_core::OpState;
 use obscura_dom::{DomTree, NodeData, NodeId};
+use obscura_dom::selector::SelectorError;
 use obscura_dom::tree::{AttachShadowError, ShadowRootMode};
 #[cfg(feature = "render")]
 use obscura_net::{RequestCredentials, RequestMode, ResourceRequest};
@@ -1507,6 +1508,13 @@ fn op_dom(
     })
 }
 
+// Error envelope for the query_selector*/matches_selector op arms: see the
+// comment above their match arms for why this shape (and not a Rust-level
+// throw) is how a "parse a selector" failure crosses the op_dom string bus.
+fn selector_syntax_error(message: &str) -> String {
+    serde_json::json!({ "error": message }).to_string()
+}
+
 fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) -> String {
     {
         // Scroll offsets belong to a node at its current tree position.
@@ -1799,42 +1807,65 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
                 }
             }
         }
-        "query_selector" => dom
-            .query_selector(&arg1)
-            .ok()
-            .flatten()
-            .map(|id| id.index().to_string())
-            .unwrap_or("-1".into()),
-        "query_selector_all" => {
-            let ids: Vec<i32> = dom
-                .query_selector_all(&arg1)
-                .ok()
-                .map(|ids| ids.iter().map(|id| id.index() as i32).collect())
-                .unwrap_or_default();
-            serde_json::to_string(&ids).unwrap_or("[]".into())
-        }
+        // "Parse a selector" (DOM §4.2.6, Selectors) failing must surface to
+        // JS as a SyntaxError, not a silent empty/false result — querySelector,
+        // querySelectorAll, matches and closest all route through here. On
+        // failure this returns a `{"error": ...}` JSON envelope instead of the
+        // command's normal success shape (a bare node-index string, "true"/
+        // "false", or a JSON array); bootstrap.js's `_selectorOp` helper
+        // detects the envelope by its leading '{' (no success shape starts
+        // with one) and throws. This mirrors the existing `{"error": ...}`
+        // envelope convention used by the fetch ops.
+        //
+        // A selector that is valid grammar but names a pseudo-class/element
+        // this engine does not implement (SelectorError::Unsupported, e.g.
+        // `:target`) is not a "parse a selector" failure — real browsers
+        // accept it and return an empty/false result — so it must fall
+        // through to the same success shape as "no match", not the
+        // SyntaxError envelope.
+        "query_selector" => match dom.query_selector(&arg1) {
+            Ok(found) => found
+                .map(|id| id.index().to_string())
+                .unwrap_or("-1".into()),
+            Err(SelectorError::Unsupported(_)) => "-1".into(),
+            Err(SelectorError::Invalid(msg)) => selector_syntax_error(&msg),
+        },
+        "query_selector_all" => match dom.query_selector_all(&arg1) {
+            Ok(ids) => {
+                let ids: Vec<i32> = ids.iter().map(|id| id.index() as i32).collect();
+                serde_json::to_string(&ids).unwrap_or("[]".into())
+            }
+            Err(SelectorError::Unsupported(_)) => "[]".into(),
+            Err(SelectorError::Invalid(msg)) => selector_syntax_error(&msg),
+        },
         "query_selector_scoped" => {
             let root_nid = arg1.parse::<u32>().unwrap_or(0);
-            dom.query_selector_from(NodeId::new(root_nid), &arg2)
-                .ok()
-                .flatten()
-                .map(|id| id.index().to_string())
-                .unwrap_or("-1".into())
+            match dom.query_selector_from(NodeId::new(root_nid), &arg2) {
+                Ok(found) => found
+                    .map(|id| id.index().to_string())
+                    .unwrap_or("-1".into()),
+                Err(SelectorError::Unsupported(_)) => "-1".into(),
+                Err(SelectorError::Invalid(msg)) => selector_syntax_error(&msg),
+            }
         }
         "query_selector_all_scoped" => {
             let root_nid = arg1.parse::<u32>().unwrap_or(0);
-            let ids: Vec<i32> = dom
-                .query_selector_all_from(NodeId::new(root_nid), &arg2)
-                .ok()
-                .map(|ids| ids.iter().map(|id| id.index() as i32).collect())
-                .unwrap_or_default();
-            serde_json::to_string(&ids).unwrap_or("[]".into())
+            match dom.query_selector_all_from(NodeId::new(root_nid), &arg2) {
+                Ok(ids) => {
+                    let ids: Vec<i32> = ids.iter().map(|id| id.index() as i32).collect();
+                    serde_json::to_string(&ids).unwrap_or("[]".into())
+                }
+                Err(SelectorError::Unsupported(_)) => "[]".into(),
+                Err(SelectorError::Invalid(msg)) => selector_syntax_error(&msg),
+            }
         }
         "matches_selector" => {
             let nid = NodeId::new(arg1.parse::<u32>().unwrap_or(0));
-            dom.matches_selector(nid, &arg2)
-                .unwrap_or(false)
-                .to_string()
+            match dom.matches_selector(nid, &arg2) {
+                Ok(matched) => matched.to_string(),
+                Err(SelectorError::Unsupported(_)) => "false".into(),
+                Err(SelectorError::Invalid(msg)) => selector_syntax_error(&msg),
+            }
         }
         "node_type" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);

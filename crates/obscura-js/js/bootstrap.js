@@ -862,6 +862,21 @@ const _formValues = globalThis._formValues;
 const _formChecked = globalThis._formChecked;
 const _formIndeterminate = globalThis._formIndeterminate;
 const _domParse = (cmd, a1, a2) => { try { return JSON.parse(_dom(cmd, a1, a2)); } catch { return null; } };
+// query_selector/query_selector_all/matches_selector (scoped and unscoped)
+// all route through "parse a selector" (DOM §4.2.6) on the Rust side. A parse
+// failure comes back as a `{"error": "..."}` JSON envelope instead of the
+// op's normal success shape (a bare node-index string, "true"/"false", or a
+// JSON array of ids) — those never start with '{', so the leading byte
+// disambiguates without needing a full parse on the hot path.
+const _selectorOp = (cmd, a1, a2) => {
+  const raw = _dom(cmd, a1, a2);
+  if (raw.charCodeAt(0) === 123 /* '{' */) {
+    let message = "The provided selector is empty or invalid.";
+    try { message = JSON.parse(raw).error || message; } catch {}
+    throw new DOMException(message, "SyntaxError");
+  }
+  return raw;
+};
 const _formStateLoaded = new Set();
 function _loadFormState(nid) {
   if (_formStateLoaded.has(nid)) return;
@@ -3919,9 +3934,9 @@ class Element extends Node {
     return this._attributes;
   }
   getAttributeNS(ns, n) { return _domParse("get_attribute_ns", this._nid, String(ns == null ? "" : ns) + "\0" + String(n)); }
-  querySelector(s) { return _wrapEl(+_dom("query_selector_scoped", this._nid, s)); }
+  querySelector(s) { return _wrapEl(+_selectorOp("query_selector_scoped", this._nid, s)); }
   querySelectorAll(s) {
-    const ids = _domParse("query_selector_all_scoped", this._nid, s) || [];
+    const ids = JSON.parse(_selectorOp("query_selector_all_scoped", this._nid, s));
     return _nodeList(ids.map(_wrapEl).filter(Boolean));
   }
   // Live HTMLCollection per DOM 4.9 ("list of elements with qualified name").
@@ -3945,7 +3960,7 @@ class Element extends Node {
       if (rest === "") return true;
       return this.matches(rest);
     }
-    return _dom("matches_selector", this._nid, String(s)) === "true";
+    return _selectorOp("matches_selector", this._nid, String(s)) === "true";
   }
   closest(s) {
     let el = this;
@@ -5782,9 +5797,9 @@ class Document extends Node {
     const needle = String(id);
     return needle === "" ? null : _wrapEl(+_dom("get_element_by_id", needle));
   }
-  querySelector(s) { return _wrapEl(+_dom("query_selector", s)); }
+  querySelector(s) { return _wrapEl(+_selectorOp("query_selector", s)); }
   querySelectorAll(s) {
-    const ids = _domParse("query_selector_all", s) || [];
+    const ids = JSON.parse(_selectorOp("query_selector_all", s));
     return _nodeList(ids.map(_wrapEl).filter(Boolean));
   }
   // Live HTMLCollection per DOM 4.5 ("list of elements with qualified name").
@@ -6378,9 +6393,9 @@ class DocumentFragment extends Node {
       _dom("set_inner_html", this._nid, html);
     }
   }
-  querySelector(s) { return _wrapEl(+_dom("query_selector_scoped", this._nid, s)); }
+  querySelector(s) { return _wrapEl(+_selectorOp("query_selector_scoped", this._nid, s)); }
   querySelectorAll(s) {
-    const ids = _domParse("query_selector_all_scoped", this._nid, s) || [];
+    const ids = JSON.parse(_selectorOp("query_selector_all_scoped", this._nid, s));
     return _nodeList(ids.map(_wrapEl).filter(Boolean));
   }
   get children() {

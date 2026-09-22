@@ -642,14 +642,53 @@ thread_local! {
 }
 const SELECTOR_CACHE_CAP: usize = 256;
 
-fn parse_selector_uncached(selector: &str) -> Result<SelectorList<ObscuraSelector>, String> {
-    let mut parser_input = cssparser::ParserInput::new(selector);
-    let mut parser = cssparser::Parser::new(&mut parser_input);
-    SelectorList::parse(&ObscuraSelectorParser, &mut parser, ParseRelative::No)
-        .map_err(|e| format!("Failed to parse selector '{}': {:?}", selector, e))
+/// A selector failed to parse. DOM §4.2.6 "parse a selector" only mandates a
+/// SyntaxError for a selector that is not itself valid Selectors grammar.
+/// Referencing a pseudo-class/pseudo-element this engine does not implement
+/// is not a grammar violation — real browsers accept it and return an
+/// empty/false result — so callers must not conflate the two.
+#[derive(Debug, Clone)]
+pub enum SelectorError {
+    /// The selector is not valid Selectors grammar; callers must surface
+    /// this to script as a SyntaxError.
+    Invalid(String),
+    /// The selector is valid grammar but names a pseudo-class/pseudo-element
+    /// this engine does not implement; callers must treat this as "no
+    /// match", not as an error.
+    Unsupported(String),
 }
 
-pub fn parse_selector(selector: &str) -> Result<SelectorList<ObscuraSelector>, String> {
+impl SelectorError {
+    pub fn message(&self) -> &str {
+        match self {
+            SelectorError::Invalid(m) | SelectorError::Unsupported(m) => m,
+        }
+    }
+}
+
+impl std::fmt::Display for SelectorError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.message())
+    }
+}
+
+fn parse_selector_uncached(
+    selector: &str,
+) -> Result<SelectorList<ObscuraSelector>, SelectorError> {
+    let mut parser_input = cssparser::ParserInput::new(selector);
+    let mut parser = cssparser::Parser::new(&mut parser_input);
+    SelectorList::parse(&ObscuraSelectorParser, &mut parser, ParseRelative::No).map_err(|e| {
+        let message = format!("Failed to parse selector '{}': {:?}", selector, e);
+        match e.kind {
+            cssparser::ParseErrorKind::Custom(
+                SelectorParseErrorKind::UnsupportedPseudoClassOrElement(_),
+            ) => SelectorError::Unsupported(message),
+            _ => SelectorError::Invalid(message),
+        }
+    })
+}
+
+pub fn parse_selector(selector: &str) -> Result<SelectorList<ObscuraSelector>, SelectorError> {
     // Hot path: cached. Cold path: parse + insert.
     if let Some(cached) = SELECTOR_CACHE.with(|c| c.borrow().get(selector).cloned()) {
         return Ok((*cached).clone());
@@ -689,11 +728,11 @@ fn simple_id_selector(selector: &str) -> Option<&str> {
 }
 
 impl DomTree {
-    pub fn query_selector(&self, selector: &str) -> Result<Option<NodeId>, String> {
+    pub fn query_selector(&self, selector: &str) -> Result<Option<NodeId>, SelectorError> {
         self.query_selector_from(self.document(), selector)
     }
 
-    pub fn query_selector_all(&self, selector: &str) -> Result<Vec<NodeId>, String> {
+    pub fn query_selector_all(&self, selector: &str) -> Result<Vec<NodeId>, SelectorError> {
         self.query_selector_all_from(self.document(), selector)
     }
 
@@ -701,7 +740,7 @@ impl DomTree {
         &self,
         root: NodeId,
         selector: &str,
-    ) -> Result<Option<NodeId>, String> {
+    ) -> Result<Option<NodeId>, SelectorError> {
         // Fast path: a bare "#id" selector resolves through the id index in O(1)
         // instead of scanning every descendant. The index holds the first element
         // in tree order per id, which is exactly what the full scan would return.
@@ -763,7 +802,7 @@ impl DomTree {
         &self,
         root: NodeId,
         selector: &str,
-    ) -> Result<Vec<NodeId>, String> {
+    ) -> Result<Vec<NodeId>, SelectorError> {
         let selector_list = parse_selector(selector)?;
         let mut caches = selectors::context::SelectorCaches::default();
         let mut context = MatchingContext::new(
@@ -794,7 +833,7 @@ impl DomTree {
 
     /// Test one element as the selector subject, including when it is
     /// detached or is a direct child of a shadow-tree compatibility root.
-    pub fn matches_selector(&self, nid: NodeId, selector: &str) -> Result<bool, String> {
+    pub fn matches_selector(&self, nid: NodeId, selector: &str) -> Result<bool, SelectorError> {
         if !self
             .with_node(nid, |node| node.is_element())
             .unwrap_or(false)

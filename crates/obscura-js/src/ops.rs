@@ -3320,6 +3320,57 @@ async fn op_fetch_url(
     let mut redirected_from = Vec::new();
     let mut crossed_origin = is_cross_origin;
     let cookie_initiator = url::Url::parse(&page_origin).ok();
+
+    // Subresource cache. This op drives its own redirect/CORS/interception
+    // transport, so it never reaches `fetch_with_profile`'s cache, and every
+    // repeat of a script the page already holds used to be another network
+    // round trip. Only GETs without a body participate, under the same
+    // `Cache-Control` policy the resource loader applies.
+    let cache_profile = ResourceRequest {
+        resource_type: if internal_load {
+            ResourceType::Other
+        } else {
+            ResourceType::Fetch
+        },
+        initiator: cookie_initiator.clone(),
+        referrer: None,
+        mode: match mode.as_str() {
+            "cors" => RequestMode::Cors,
+            "same-origin" => RequestMode::SameOrigin,
+            "navigate" => RequestMode::Navigate,
+            _ => RequestMode::NoCors,
+        },
+        credentials: match credentials {
+            FetchCredentials::Omit => RequestCredentials::Omit,
+            FetchCredentials::Include => RequestCredentials::Include,
+            FetchCredentials::SameOrigin => RequestCredentials::SameOrigin,
+        },
+        max_response_bytes: fetch_max_body_bytes(),
+    };
+    let cache_headers: Vec<(String, String)> = current_headers
+        .iter()
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect();
+    let cache_url = (current_method == reqwest::Method::GET && current_body.is_empty())
+        .then(|| url::Url::parse(&current_url).ok())
+        .flatten();
+    let cached = match (&http_client, &cache_url) {
+        (Some(client), Some(parsed)) => {
+            client
+                .cached_scripted_response(parsed, &cache_profile, &cache_headers)
+                .await
+        }
+        _ => None,
+    };
+
+    let cache_hit = cached.is_some();
+    let (status, resp_headers, resp_bytes, redirected) = if let Some(hit) = cached {
+        // The CORS gate below runs for a hit exactly as for a fresh response.
+        // Nothing redirected is ever stored, so the request URL is also the
+        // response URL and `redirected` stays false.
+        tracing::debug!("op_fetch_url cache hit: {} ({} bytes)", current_url, hit.body.len());
+        (hit.status, hit.headers, hit.body, false)
+    } else {
     let response = loop {
         let mut req = client
             .request(current_method.clone(), &current_url)
@@ -3505,6 +3556,10 @@ async fn op_fetch_url(
         .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
         .collect();
 
+    let resp_bytes = read_body_capped(response, fetch_max_body_bytes()).await?;
+    (status, resp_headers, resp_bytes, redirected)
+    };
+
     let final_is_cross_origin = request_origin(&current_url)
         .map(|request_origin| request_origin != page_origin)
         .unwrap_or(false);
@@ -3538,7 +3593,27 @@ async fn op_fetch_url(
         }
     }
 
-    let resp_bytes = read_body_capped(response, fetch_max_body_bytes()).await?;
+    // Store only what passed the CORS gate above, so a later hit on the same
+    // key is equivalent to repeating the request.
+    if !cache_hit {
+        if let (Some(client), Some(parsed)) = (&http_client, &cache_url) {
+            client
+                .store_scripted_response(
+                    parsed,
+                    &cache_profile,
+                    &cache_headers,
+                    &Response {
+                        url: parsed.clone(),
+                        status,
+                        headers: resp_headers.clone(),
+                        body: resp_bytes.clone(),
+                        redirected_from: redirected_from.clone(),
+                    },
+                )
+                .await;
+        }
+    }
+
     let resp_body = String::from_utf8_lossy(&resp_bytes).to_string();
     let resp_body_base64 = BASE64.encode(&resp_bytes);
     if let Some(ref cbs) = callbacks {

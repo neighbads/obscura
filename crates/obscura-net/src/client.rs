@@ -1326,6 +1326,79 @@ impl ObscuraHttpClient {
         })
     }
 
+    /// Cache key for a request the caller drives on its own transport.
+    ///
+    /// `op_fetch_url` in `obscura-js` runs its own redirect, CORS and
+    /// interception logic, so it cannot go through `fetch_with_profile`, but
+    /// its responses belong in the same per-context subresource cache. It
+    /// sends caller-supplied request headers the resource loader never sends,
+    /// so those join the key: two `fetch()` calls that differ in them are
+    /// different requests and must not share one cached body.
+    async fn scripted_cache_key(
+        &self,
+        url: &Url,
+        request: &ResourceRequest,
+        request_headers: &[(String, String)],
+    ) -> Option<ResourceCacheKey> {
+        let mut key = self
+            .resource_cache_key(&Method::GET, url, &None, request)
+            .await?;
+        let mut scripted = request_headers
+            .iter()
+            .map(|(name, value)| (name.to_ascii_lowercase(), value.clone()))
+            .collect::<Vec<_>>();
+        if scripted.iter().any(|(name, value)| {
+            name == "authorization"
+                || name == "cookie"
+                || (name == "cache-control"
+                    && (value.to_ascii_lowercase().contains("no-cache")
+                        || value.to_ascii_lowercase().contains("no-store")))
+        }) {
+            return None;
+        }
+        scripted.sort();
+        key.extra_headers.extend(scripted);
+        Some(key)
+    }
+
+    /// Subresource-cache lookup for a caller-driven request.
+    ///
+    /// Returns a stored body only while it is still fresh under the same
+    /// `Cache-Control` policy [`ObscuraHttpClient::fetch_resource_with_callbacks`]
+    /// applies.
+    pub async fn cached_scripted_response(
+        &self,
+        url: &Url,
+        request: &ResourceRequest,
+        request_headers: &[(String, String)],
+    ) -> Option<Response> {
+        let key = self.scripted_cache_key(url, request, request_headers).await?;
+        self.resource_loader.lock().unwrap().cache.get(&key)
+    }
+
+    /// Store a caller-driven response in the subresource cache, subject to the
+    /// same freshness policy the resource loader uses (2xx, not redirected, no
+    /// `Set-Cookie`, no `Vary: *`, explicit positive `max-age`).
+    pub async fn store_scripted_response(
+        &self,
+        url: &Url,
+        request: &ResourceRequest,
+        request_headers: &[(String, String)],
+        response: &Response,
+    ) {
+        let Some(lifetime) = response_cache_lifetime(response) else {
+            return;
+        };
+        let Some(key) = self.scripted_cache_key(url, request, request_headers).await else {
+            return;
+        };
+        self.resource_loader
+            .lock()
+            .unwrap()
+            .cache
+            .insert(key, response.clone(), lifetime);
+    }
+
     async fn fetch_with_profile(
         &self,
         initial_method: Method,

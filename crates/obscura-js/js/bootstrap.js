@@ -917,6 +917,22 @@ function _getElementsByClassName(root, classNames) {
   // tree shape, so this collection tracks the attribute-inclusive epoch.
   return _liveHTMLCollection(() => _matchClassNames(root, tokens), true);
 }
+// Shared getElementsByTagName. The match is NOT `querySelectorAll(name)`: a CSS
+// type selector matches an element's local name, and matches HTML elements
+// ASCII-case-insensitively in an HTML document. DOM 4.5/4.9 instead matches the
+// QUALIFIED name and splits on namespace - in an HTML document the argument is
+// lowercased before it is compared against HTML-namespace elements, and
+// compared verbatim against everything else. So `FOO` finds `html:foo` and
+// `svg:FOO` but not `html:FOO`, and `linearGradient` finds the SVG element
+// while `lineargradient` does not. `*` matches every descendant element. The
+// native op also cannot throw on an argument that is not a valid selector,
+// which `getElementsByTagName("1")` is not.
+// Live per DOM 4.9; membership depends only on tree shape.
+const _elementsByTagName = (rootNid, qualifiedName) => {
+  const name = String(qualifiedName);
+  return _liveHTMLCollection(() =>
+    (_domParse("elements_by_qualified_name", rootNid, name) || []).map(_wrapEl).filter(Boolean));
+};
 let _consoleOid = 0;
 const _consoleObjectId = (value) => {
   const objectId = "console-" + (globalThis.__obscura_frameId >>> 0) + "-" + (++_consoleOid);
@@ -3898,7 +3914,7 @@ class Element extends Node {
     return _nodeList(ids.map(_wrapEl).filter(Boolean));
   }
   // Live HTMLCollection per DOM 4.9 ("list of elements with qualified name").
-  getElementsByTagName(t) { return _liveHTMLCollection(() => this.querySelectorAll(t)); }
+  getElementsByTagName(t) { return _elementsByTagName(this._nid, t); }
   getElementsByClassName(c) { return _getElementsByClassName(this, c); }
   matches(s) {
     // :popover-open is a JS-observable popover state, not understood by the
@@ -5741,7 +5757,7 @@ class Document extends Node {
     return _nodeList(ids.map(_wrapEl).filter(Boolean));
   }
   // Live HTMLCollection per DOM 4.5 ("list of elements with qualified name").
-  getElementsByTagName(t) { return _liveHTMLCollection(() => this.querySelectorAll(t)); }
+  getElementsByTagName(t) { return _elementsByTagName(this._nid, t); }
   getElementsByClassName(c) { return _getElementsByClassName(this, c); }
   getElementsByName(name) { return this.querySelectorAll('[name="' + String(name).replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"]'); }
   evaluate(expression, contextNode, namespaceResolver, type, result) {
@@ -11177,8 +11193,9 @@ globalThis.DOMParser = class DOMParser {
       getElementById(id) {
         return walk(root, n => n.getAttribute && n.getAttribute("id") === id);
       },
+      // Live HTMLCollection per DOM 4.5, like the real Document's.
       getElementsByTagName(t) {
-        return root.querySelectorAll(t);
+        return _elementsByTagName(root._nid, t);
       },
       getElementsByClassName(c) {
         return _getElementsByClassName(root, c);
@@ -13307,8 +13324,9 @@ class _IframeDocument {
   querySelectorAll(sel) {
     return this._root.querySelectorAll(sel);
   }
+  // Live HTMLCollection per DOM 4.5, like the real Document's.
   getElementsByTagName(tag) {
-    return this._root.querySelectorAll(tag);
+    return _elementsByTagName(this._root._nid, tag);
   }
   getElementsByClassName(cls) {
     return _getElementsByClassName(this._root, cls);

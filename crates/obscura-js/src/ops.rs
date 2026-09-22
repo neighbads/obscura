@@ -1952,6 +1952,49 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
                 .unwrap_or_default();
             serde_json::to_string(&name).unwrap_or("\"\"".into())
         }
+        // DOM 4.5 / 4.9, "list of elements with qualified name qualifiedName".
+        // This is deliberately not a selector query. A CSS type selector matches
+        // an element's LOCAL name, and in an HTML document it matches HTML
+        // elements ASCII-case-insensitively; the spec filter here matches the
+        // QUALIFIED name (prefix included) and splits on namespace instead:
+        //   * -> every descendant element
+        //   HTML namespace -> qualified name equals qualifiedName lowercased
+        //   other namespace -> qualified name equals qualifiedName verbatim
+        // So `FOO` finds html:foo and svg:FOO but not html:FOO, and
+        // `linearGradient` finds the SVG element while `lineargradient` does not.
+        "elements_by_qualified_name" => {
+            let root = NodeId::new(arg1.parse::<u32>().unwrap_or(0));
+            let any = arg2 == "*";
+            let lowered = arg2.to_ascii_lowercase();
+            let ids: Vec<i32> = dom
+                .descendants(root)
+                .into_iter()
+                .filter(|&id| {
+                    dom.with_node(id, |n| {
+                        let Some(name) = n.as_element() else {
+                            return false;
+                        };
+                        if any {
+                            return true;
+                        }
+                        let wanted: &str = if name.ns == html5ever::ns!(html) {
+                            &lowered
+                        } else {
+                            &arg2
+                        };
+                        // The unprefixed case is the overwhelmingly common one
+                        // and compares without building the qualified name.
+                        match &name.prefix {
+                            None => name.local.as_ref() == wanted,
+                            Some(prefix) => format!("{}:{}", prefix, name.local) == wanted,
+                        }
+                    })
+                    .unwrap_or(false)
+                })
+                .map(|id| id.index() as i32)
+                .collect();
+            serde_json::to_string(&ids).unwrap_or("[]".into())
+        }
         "local_name" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
             let name = dom

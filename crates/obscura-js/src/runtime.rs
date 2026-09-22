@@ -21878,4 +21878,125 @@ mod tests {
             "named access, item(), `in`, spread and forEach must work through the live proxy"
         );
     }
+
+    // ---- getElementsByTagName qualified-name matching (R-47) ------------
+    // DOM 4.5/4.9: in an HTML document the argument matches HTML-namespace
+    // elements only after ASCII-lowercasing, and every other namespace only
+    // verbatim, against the element's QUALIFIED name.
+
+    #[test]
+    fn get_elements_by_tag_name_folds_case_for_html_elements_only() {
+        // HTML-namespace elements are found under any spelling, because the
+        // argument is lowercased before it is compared against them. The SVG
+        // element next to them carries the same lowercase local name and is NOT
+        // found under an uppercase spelling, because foreign elements are
+        // compared verbatim.
+        let mut rt = setup_runtime("<html><body><div id='dst'><i></i></div></body></html>");
+        let out = rt
+            .evaluate(
+                "(function(){var d=document.getElementById('dst');\
+                 d.appendChild(document.createElementNS('http://www.w3.org/2000/svg','i'));\
+                 return [d.getElementsByTagName('i').length,\
+                 d.getElementsByTagName('I').length,\
+                 d.getElementsByTagName('I')[0].namespaceURI,\
+                 d.getElementsByTagName('i')[1].namespaceURI].join(',');})()",
+            )
+            .unwrap();
+        assert_eq!(
+            out,
+            serde_json::json!(
+                "2,1,http://www.w3.org/1999/xhtml,http://www.w3.org/2000/svg"
+            ),
+            "`I` must fold onto html:i and must not reach the identically named SVG element"
+        );
+    }
+
+    #[test]
+    fn get_elements_by_tag_name_matches_foreign_elements_verbatim() {
+        let mut rt = setup_runtime(
+            "<html><body><div id='dst'><svg><linearGradient/><rect/></svg></div></body></html>",
+        );
+        let out = rt
+            .evaluate(
+                "(function(){var d=document.getElementById('dst');\
+                 d.appendChild(document.createElementNS('http://www.w3.org/2000/svg','FOO'));\
+                 return [d.getElementsByTagName('linearGradient').length,\
+                 d.getElementsByTagName('lineargradient').length,\
+                 d.getElementsByTagName('LINEARGRADIENT').length,\
+                 d.getElementsByTagName('FOO').length,\
+                 d.getElementsByTagName('foo').length,\
+                 d.getElementsByTagName('FOO')[0].namespaceURI].join(',');})()",
+            )
+            .unwrap();
+        assert_eq!(
+            out,
+            serde_json::json!("1,0,0,1,0,http://www.w3.org/2000/svg"),
+            "foreign elements match the argument verbatim, so case must be preserved both ways"
+        );
+    }
+
+    #[test]
+    fn get_elements_by_tag_name_matches_the_qualified_name_not_the_local_name() {
+        let mut rt = setup_runtime("<html><body><div id='dst'></div></body></html>");
+        let out = rt
+            .evaluate(
+                "(function(){var d=document.getElementById('dst');\
+                 d.appendChild(document.createElementNS('urn:example','p:q'));\
+                 return [d.getElementsByTagName('p:q').length,\
+                 d.getElementsByTagName('q').length].join(',');})()",
+            )
+            .unwrap();
+        assert_eq!(
+            out,
+            serde_json::json!("1,0"),
+            "a prefixed element is found by prefix:local, not by its local name alone"
+        );
+    }
+
+    #[test]
+    fn get_elements_by_tag_name_star_and_invalid_selector_arguments() {
+        let mut rt = setup_runtime(
+            "<html><body><div id='dst'><i></i><b><u></u></b></div></body></html>",
+        );
+        let out = rt
+            .evaluate(
+                "(function(){var d=document.getElementById('dst');\
+                 var star=d.getElementsByTagName('*');\
+                 var threw=false;var n=-1;\
+                 try{n=d.getElementsByTagName('1').length;}catch(e){threw=true;}\
+                 return [star.length,star[0].tagName,threw,n,\
+                 document.getElementsByTagName('*').length>3].join(',');})()",
+            )
+            .unwrap();
+        assert_eq!(
+            out,
+            serde_json::json!("3,I,false,0,true"),
+            "`*` matches every descendant element and a non-selector argument must not throw"
+        );
+    }
+
+    #[test]
+    fn get_elements_by_tag_name_stays_live_under_every_mutation_path() {
+        let mut rt = setup_runtime(
+            "<html><body><div id='src'><i></i><i></i></div><div id='dst'></div></body></html>",
+        );
+        let out = rt
+            .evaluate(
+                "(function(){var u=document.getElementById('src');var c=u.getElementsByTagName('i');\
+                 var r=[c.length];\
+                 u.appendChild(document.createElement('i'));r.push(c.length);\
+                 u.insertBefore(document.createElement('i'),u.firstChild);r.push(c.length);\
+                 u.replaceChild(document.createElement('b'),c[0]);r.push(c.length);\
+                 u.appendChild(c[0]);r.push(c.length);\
+                 document.getElementById('dst').appendChild(c[0]);r.push(c.length);\
+                 u.innerHTML='<i></i>';r.push(c.length);\
+                 return r.join(',');})()",
+            )
+            .unwrap();
+        assert_eq!(
+            out,
+            serde_json::json!("2,3,4,3,3,2,1"),
+            "getElementsByTagName must stay live after the matching rewrite"
+        );
+    }
 }

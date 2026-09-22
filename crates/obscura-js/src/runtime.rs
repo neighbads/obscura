@@ -6045,6 +6045,249 @@ mod tests {
         assert_eq!(result, serde_json::json!([["b"], 0]));
     }
 
+    // R-50 — `PerformanceObserver` was a stub whose observe()/disconnect()
+    // did nothing and which was missing takeRecords() entirely (walmart.com
+    // threw `TypeError: i.takeRecords is not a function`). Performance
+    // Timeline Level 2 observe() validation: exactly one of `entryTypes`/
+    // `type` must be present (never both, never neither), and once an
+    // observer has picked a mode further observe() calls in the other mode
+    // throw InvalidModificationError rather than silently switching.
+    #[test]
+    fn performance_observer_observe_requires_exactly_one_of_type_or_entry_types() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(function(){
+                    function throws(options) {
+                        try {
+                            new PerformanceObserver(() => {}).observe(options);
+                            return "no-throw";
+                        } catch (e) {
+                            return e instanceof TypeError ? "TypeError" : e.name;
+                        }
+                    }
+                    return [
+                        throws({}),
+                        throws({ entryTypes: ["mark"], type: "measure" }),
+                        throws({ entryTypes: ["mark"], buffered: true }),
+                    ];
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!(["TypeError", "TypeError", "TypeError"])
+        );
+    }
+
+    #[test]
+    fn performance_observer_locks_to_its_first_mode() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(function(){
+                    const single = new PerformanceObserver(() => {});
+                    single.observe({ type: "mark" });
+                    let singleToMultiple;
+                    try {
+                        single.observe({ entryTypes: ["mark", "measure"] });
+                        singleToMultiple = "no-throw";
+                    } catch (e) { singleToMultiple = e.name; }
+
+                    const multiple = new PerformanceObserver(() => {});
+                    multiple.observe({ entryTypes: ["mark"] });
+                    let multipleToSingle;
+                    try {
+                        multiple.observe({ type: "measure" });
+                        multipleToSingle = "no-throw";
+                    } catch (e) { multipleToSingle = e.name; }
+
+                    return [singleToMultiple, multipleToSingle];
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!(["InvalidModificationError", "InvalidModificationError"])
+        );
+    }
+
+    // Per spec, entryTypes/type made up entirely of types the UA does not
+    // support does not throw — registration is silently aborted with a
+    // console warning. `resource`/`navigation`/`paint` were dropped from
+    // supportedEntryTypes below because the engine never produces entries of
+    // those types (see __perfEntries and performance.mark/measure), so they
+    // now exercise this exact "unsupported" path rather than a dead promise.
+    #[test]
+    fn performance_observer_unsupported_types_warn_and_do_not_throw() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(function(){
+                    function warnsWithoutThrowing(options) {
+                        let warned = false;
+                        const originalWarn = console.warn;
+                        console.warn = () => { warned = true; };
+                        let threw = false;
+                        try { new PerformanceObserver(() => {}).observe(options); }
+                        catch (e) { threw = true; }
+                        console.warn = originalWarn;
+                        return [threw, warned];
+                    }
+                    return [
+                        warnsWithoutThrowing({ entryTypes: ["resource", "navigation", "paint"] }),
+                        warnsWithoutThrowing({ type: "resource" }),
+                    ];
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([[false, true], [false, true]])
+        );
+    }
+
+    #[test]
+    fn performance_observer_supported_entry_types_matches_entries_the_engine_produces() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate("PerformanceObserver.supportedEntryTypes")
+            .unwrap();
+        assert_eq!(result, serde_json::json!(["mark", "measure"]));
+    }
+
+    // takeRecords() is the method whose absence broke walmart.com. It must
+    // exist, return the queued-but-undelivered entries, and empty the queue
+    // so a later delivery task has nothing left to send.
+    #[tokio::test(flavor = "current_thread")]
+    async fn performance_observer_take_records_drains_the_pending_queue() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script(
+            "performance-observer-take-records",
+            r#"
+                globalThis.__poCalls = [];
+                const po = new PerformanceObserver((entries) => {
+                    __poCalls.push(entries.getEntries().map((e) => e.name));
+                });
+                po.observe({ type: "mark" });
+                performance.mark("first");
+                performance.mark("second");
+                globalThis.__taken = po.takeRecords().map((e) => e.name);
+            "#,
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            rt.evaluate("[__taken, __poCalls]").unwrap(),
+            serde_json::json!([["first", "second"], []]),
+            "takeRecords() must drain the queue so the deferred delivery task has nothing left"
+        );
+    }
+
+    // Delivery happens on a later task, never synchronously inside observe()
+    // or once per entry: two marks created in the same turn must reach the
+    // callback together, as one PerformanceObserverEntryList, not as two
+    // separate invocations.
+    #[tokio::test(flavor = "current_thread")]
+    async fn performance_observer_delivers_asynchronously_and_batches_same_turn_entries() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script(
+            "performance-observer-batches-delivery",
+            r#"
+                globalThis.__poCallCount = 0;
+                globalThis.__poEntryNames = [];
+                globalThis.__poArgsShape = [];
+                const po = new PerformanceObserver((entries, observer, options) => {
+                    __poCallCount++;
+                    __poEntryNames.push(entries.getEntries().map((e) => e.name));
+                    __poArgsShape.push([
+                        entries instanceof PerformanceObserverEntryList,
+                        typeof entries.getEntries === "function",
+                        typeof entries.getEntriesByType === "function",
+                        typeof entries.getEntriesByName === "function",
+                        Array.isArray(entries),
+                        observer === po,
+                        typeof options.droppedEntriesCount,
+                    ]);
+                });
+                po.observe({ type: "mark" });
+                performance.mark("a");
+                performance.mark("b");
+                // Delivery must not have happened synchronously yet.
+                globalThis.__poCallCountRightAfterMarks = __poCallCount;
+            "#,
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            rt.evaluate(
+                "[__poCallCountRightAfterMarks, __poCallCount, __poEntryNames, __poArgsShape]"
+            )
+            .unwrap(),
+            serde_json::json!([
+                0,
+                1,
+                [["a", "b"]],
+                [[true, true, true, true, false, true, "number"]],
+            ]),
+            "both marks from the same turn must arrive in a single deferred callback call"
+        );
+    }
+
+    // buffered: true must backfill entries that were already in
+    // performance's entry buffer before observe() was called, in addition to
+    // entries created afterwards.
+    #[tokio::test(flavor = "current_thread")]
+    async fn performance_observer_buffered_true_replays_pre_existing_entries() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script(
+            "performance-observer-buffered",
+            r#"
+                performance.mark("before-observe");
+                globalThis.__poBatches = [];
+                const po = new PerformanceObserver((entries) => {
+                    __poBatches.push(entries.getEntries().map((e) => e.name));
+                });
+                po.observe({ type: "mark", buffered: true });
+                performance.mark("after-observe");
+            "#,
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            rt.evaluate("__poBatches").unwrap(),
+            serde_json::json!([["before-observe", "after-observe"]]),
+            "buffered:true must replay the pre-existing entry alongside later ones, batched together"
+        );
+    }
+
+    // disconnect() must empty the pending queue and stop the observer from
+    // receiving anything queued after it, even entries that were queued
+    // (via a synchronous mark()) before disconnect() ran but before the
+    // deferred delivery task fired.
+    #[tokio::test(flavor = "current_thread")]
+    async fn performance_observer_disconnect_clears_queue_and_stops_delivery() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script(
+            "performance-observer-disconnect",
+            r#"
+                globalThis.__poCalls = 0;
+                const po = new PerformanceObserver(() => { __poCalls++; });
+                po.observe({ type: "mark" });
+                performance.mark("queued-before-disconnect");
+                po.disconnect();
+                performance.mark("after-disconnect");
+            "#,
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            rt.evaluate("[__poCalls]").unwrap(),
+            serde_json::json!([0]),
+            "disconnect() must drop the already-queued entry and ignore anything observed afterwards"
+        );
+    }
+
     #[test]
     fn childnode_helpers_coerce_non_string_primitives_to_text() {
         let mut rt =

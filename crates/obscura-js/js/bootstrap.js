@@ -10434,11 +10434,148 @@ globalThis.IntersectionObserver = class IntersectionObserver {
   else Promise.resolve().then(wireUp);
 })();
 globalThis.IntersectionObserverEntry = class IntersectionObserverEntry {};
-globalThis.PerformanceObserver = class { constructor(){} observe(){} disconnect(){} };
+
+// Performance Timeline Level 2 §4.3: a PerformanceObserverCallback receives a
+// PerformanceObserverEntryList, not a bare array, so it can be queried with
+// getEntries()/getEntriesByType()/getEntriesByName() like `performance` itself.
+globalThis.PerformanceObserverEntryList = class PerformanceObserverEntryList {
+  constructor(entries) { this._entries = entries; }
+  getEntries() {
+    return this._entries.slice().sort((a, b) => a.startTime - b.startTime);
+  }
+  getEntriesByType(type) {
+    return this._entries.filter((e) => e.entryType === type).sort((a, b) => a.startTime - b.startTime);
+  }
+  getEntriesByName(name, type) {
+    return this._entries
+      .filter((e) => e.name === name && (type === undefined || e.entryType === type))
+      .sort((a, b) => a.startTime - b.startTime);
+  }
+};
+
+// Registered observers (Performance Timeline §4.1 "list of registered
+// performance observer objects") plus one-task-per-turn coalescing for
+// "queue the PerformanceObserver task" (§3.2): every entry queued during the
+// current task/microtask turn is delivered to each observer as a single
+// callback call, not one call per entry.
+const __performanceObservers = new Set();
+let _poTaskQueued = false;
+
+function _poQueueTask() {
+  if (_poTaskQueued) return;
+  _poTaskQueued = true;
+  // The performance timeline task source is a low-priority queue "processed
+  // by the user agent during idle periods" (§3.2), hence "background" rather
+  // than the "user-visible" rank IntersectionObserver delivery uses above.
+  _browserPostedTaskEnqueue(() => {
+    _poTaskQueued = false;
+    for (const po of [...__performanceObservers]) {
+      if (!po._buffer.length) continue;
+      const entries = po._buffer.splice(0);
+      const list = new PerformanceObserverEntryList(entries);
+      try { po._callback(list, po, { droppedEntriesCount: 0 }); }
+      catch (e) { console.error(e); }
+    }
+  }, _schedulerPriorityRank["background"] * 2);
+}
+
+// "queue a PerformanceEntry" (Performance Timeline §4.2): called from
+// performance.mark()/measure() whenever a new entry is created. Routes the
+// entry to every observer whose options list includes its type, then queues
+// delivery.
+function _poQueueEntry(entry) {
+  let queued = false;
+  for (const po of __performanceObservers) {
+    if (po._options.some((opt) => opt.type === entry.entryType)) {
+      po._buffer.push(entry);
+      queued = true;
+    }
+  }
+  if (queued) _poQueueTask();
+}
+
+globalThis.PerformanceObserver = class PerformanceObserver {
+  constructor(callback) {
+    if (typeof callback !== "function") {
+      throw new TypeError(
+        "Failed to construct 'PerformanceObserver': The callback provided as parameter 1 is not a function.");
+    }
+    this._callback = callback;
+    this._type = undefined; // "single" | "multiple", locked in by the first observe() call
+    this._options = []; // list of { type, buffered }
+    this._buffer = []; // undelivered entries ("observer buffer")
+  }
+  observe(options) {
+    options = options && typeof options === "object" ? options : {};
+    const hasEntryTypes = options.entryTypes !== undefined;
+    const hasType = options.type !== undefined;
+    if (!hasEntryTypes && !hasType) {
+      throw new TypeError(
+        "Failed to execute 'observe' on 'PerformanceObserver': required member entryTypes or type is undefined.");
+    }
+    if (hasEntryTypes && (hasType || options.buffered !== undefined)) {
+      throw new TypeError(
+        "Failed to execute 'observe' on 'PerformanceObserver': entryTypes cannot be combined with type or buffered.");
+    }
+    if (hasEntryTypes) {
+      if (this._type === "single") {
+        throw new DOMException(
+          "Failed to execute 'observe' on 'PerformanceObserver': This observer has already been bound to a single entry type.",
+          "InvalidModificationError");
+      }
+      this._type = "multiple";
+      const requested = Array.from(options.entryTypes, String);
+      // §4.4 step: unsupported types are dropped silently (with a console
+      // warning), not rejected — only an *empty* result aborts registration.
+      const types = requested.filter((t) => PerformanceObserver.supportedEntryTypes.includes(t));
+      if (!types.length) {
+        console.warn("PerformanceObserver.observe() was called with entryTypes containing only unsupported types.");
+        return;
+      }
+      this._options = types.map((type) => ({ type, buffered: false }));
+      __performanceObservers.add(this);
+      return;
+    }
+    if (this._type === "multiple") {
+      throw new DOMException(
+        "Failed to execute 'observe' on 'PerformanceObserver': This observer has already been bound to multiple entry types.",
+        "InvalidModificationError");
+    }
+    this._type = "single";
+    const type = String(options.type);
+    if (!PerformanceObserver.supportedEntryTypes.includes(type)) {
+      console.warn("PerformanceObserver.observe() was called with an unsupported type: " + type);
+      return;
+    }
+    const buffered = !!options.buffered;
+    const existing = this._options.find((opt) => opt.type === type);
+    if (existing) existing.buffered = buffered;
+    else this._options.push({ type, buffered });
+    __performanceObservers.add(this);
+    if (buffered) {
+      const backlog = __perfEntries.filter((e) => e.entryType === type);
+      if (backlog.length) {
+        this._buffer.push(...backlog);
+        _poQueueTask();
+      }
+    }
+  }
+  takeRecords() {
+    return this._buffer.splice(0);
+  }
+  disconnect() {
+    __performanceObservers.delete(this);
+    this._buffer.length = 0;
+    this._options = [];
+  }
+};
 // Feature detection reads this static before deciding to observe anything;
 // absent it, supportedEntryTypes.includes(...) throws and instrumentation
-// bails. Report only types the engine can actually emit records for.
-PerformanceObserver.supportedEntryTypes = ["mark", "measure", "navigation", "resource", "paint"];
+// bails. Report only types the engine can actually emit records for: the
+// engine's performance entry buffer (see __perfEntries below) only ever holds
+// "mark" and "measure" entries — it has no navigation/resource/paint entry
+// source, so those three are left off rather than advertised and never filled.
+PerformanceObserver.supportedEntryTypes = ["mark", "measure"];
 _markNative(PerformanceObserver);
 
 globalThis.DOMException = (function () {
@@ -11420,6 +11557,7 @@ globalThis.performance = globalThis.performance || {
       detail: (options && options.detail !== undefined) ? options.detail : null,
     };
     __perfEntries.push(entry);
+    _poQueueEntry(entry);
     return entry;
   },
   measure(name, startOrOptions, endMark) {
@@ -11441,6 +11579,7 @@ globalThis.performance = globalThis.performance || {
     }
     const entry = { name, entryType: "measure", startTime: start, duration: end - start, detail };
     __perfEntries.push(entry);
+    _poQueueEntry(entry);
     return entry;
   },
   clearMarks(name) {

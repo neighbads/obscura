@@ -21580,4 +21580,213 @@ mod tests {
             "label association must follow the HTML labelable-element rules"
         );
     }
+
+    // ---- Live collections (DOM 4.2.10) ----------------------------------
+    // childNodes, children and the getElementsBy* families must observe the
+    // current tree, not the tree as it was when the collection was made.
+
+    const LIVE_FIXTURE: &str = r#"<html><body><div id="src"><i>a</i><b>c</b><u>d</u></div>
+        <div id="dst"></div></body></html>"#;
+
+    #[test]
+    fn child_nodes_length_drops_after_remove_child() {
+        let mut rt = setup_runtime(LIVE_FIXTURE);
+        let out = rt
+            .evaluate(
+                "(function(){var u=document.getElementById('src');var f=u.childNodes;\
+                 var before=f.length;u.removeChild(u.firstChild);\
+                 return before+','+f.length;})()",
+            )
+            .unwrap();
+        assert_eq!(out, serde_json::json!("3,2"), "childNodes must be live");
+    }
+
+    #[test]
+    fn child_nodes_drain_loop_terminates() {
+        // The idiom that hangs against a static childNodes: bing's sj_appHTML
+        // moves every child into a fragment, relying on f.length shrinking.
+        let mut rt = setup_runtime(LIVE_FIXTURE);
+        let out = rt
+            .evaluate(
+                "(function(){var u=document.getElementById('src');var f=u.childNodes;\
+                 var h=document.createDocumentFragment();var i=0;\
+                 for(;f.length&&i<200;){h.appendChild(f[0]);i++;}\
+                 document.getElementById('dst').appendChild(h);\
+                 return [i,f.length,document.getElementById('dst').childNodes.length].join(',');})()",
+            )
+            .unwrap();
+        assert_eq!(
+            out,
+            serde_json::json!("3,0,3"),
+            "the drain loop must run once per child and move all of them"
+        );
+    }
+
+    #[test]
+    fn child_nodes_reflects_append_insert_replace_and_move() {
+        let mut rt = setup_runtime(LIVE_FIXTURE);
+        let out = rt
+            .evaluate(
+                "(function(){var u=document.getElementById('src');var f=u.childNodes;var r=[];\
+                 u.appendChild(document.createElement('s'));r.push(f.length);\
+                 u.insertBefore(document.createElement('p'),u.firstChild);\
+                 r.push(f.length+':'+f[0].tagName);\
+                 u.replaceChild(document.createElement('q'),f[0]);r.push(f.length+':'+f[0].tagName);\
+                 u.appendChild(f[0]);r.push(f[0].tagName+':'+f[f.length-1].tagName);\
+                 return r.join('|');})()",
+            )
+            .unwrap();
+        assert_eq!(
+            out,
+            serde_json::json!("4|5:P|5:Q|I:Q"),
+            "append, insertBefore, replaceChild and same-parent move must all show up"
+        );
+    }
+
+    #[test]
+    fn child_nodes_reflects_inner_html_rewrite_and_steal() {
+        let mut rt = setup_runtime(LIVE_FIXTURE);
+        let out = rt
+            .evaluate(
+                "(function(){var u=document.getElementById('src');var d=document.getElementById('dst');\
+                 var f=u.childNodes;var r=[];\
+                 d.appendChild(f[0]);r.push(f.length);\
+                 u.innerHTML='<em>1</em><em>2</em>';r.push(f.length+':'+f[0].tagName);\
+                 u.innerHTML='';r.push(f.length);return r.join('|');})()",
+            )
+            .unwrap();
+        assert_eq!(
+            out,
+            serde_json::json!("2|2:EM|0"),
+            "moving a child elsewhere and rewriting innerHTML must both be observed"
+        );
+    }
+
+    #[test]
+    fn child_nodes_mutated_during_iteration_skips_like_a_live_list() {
+        // for..of walks indices 0,1,2,... over a shrinking list, so removing
+        // the current node makes the next one be skipped. A snapshot would
+        // instead visit, and remove, all four.
+        let mut rt = setup_runtime(
+            "<html><body><div id='src'><i>a</i><b>b</b><u>c</u><s>d</s></div></body></html>",
+        );
+        let out = rt
+            .evaluate(
+                "(function(){var u=document.getElementById('src');var seen=[];\
+                 for(var n of u.childNodes){seen.push(n.tagName);u.removeChild(n);}\
+                 return seen.join(',')+';'+Array.from(u.childNodes).map(function(n){return n.tagName}).join(',');})()",
+            )
+            .unwrap();
+        assert_eq!(
+            out,
+            serde_json::json!("I,U;B,S"),
+            "iteration over a live NodeList must see the removals"
+        );
+    }
+
+    #[test]
+    fn child_nodes_returns_the_same_object_every_time() {
+        let mut rt = setup_runtime(LIVE_FIXTURE);
+        let out = rt
+            .evaluate(
+                "(function(){var u=document.getElementById('src');\
+                 return (u.childNodes===u.childNodes)+','+(u.childNodes instanceof NodeList);})()",
+            )
+            .unwrap();
+        assert_eq!(out, serde_json::json!("true,true"));
+    }
+
+    #[test]
+    fn element_children_collection_is_live() {
+        let mut rt = setup_runtime(LIVE_FIXTURE);
+        let out = rt
+            .evaluate(
+                "(function(){var u=document.getElementById('src');var c=u.children;\
+                 var before=c.length;u.appendChild(document.createElement('s'));\
+                 var after=c.length;u.removeChild(u.firstElementChild);\
+                 return [before,after,c.length,u.firstElementChild.tagName].join(',');})()",
+            )
+            .unwrap();
+        assert_eq!(out, serde_json::json!("3,4,3,B"));
+    }
+
+    #[test]
+    fn get_elements_by_tag_name_collection_is_live() {
+        let mut rt = setup_runtime(LIVE_FIXTURE);
+        let out = rt
+            .evaluate(
+                "(function(){var c=document.getElementsByTagName('i');var before=c.length;\
+                 document.getElementById('dst').appendChild(document.createElement('i'));\
+                 var after=c.length;c[0].parentNode.removeChild(c[0]);\
+                 return [before,after,c.length].join(',');})()",
+            )
+            .unwrap();
+        assert_eq!(out, serde_json::json!("1,2,1"), "R-45: must be a live HTMLCollection");
+    }
+
+    #[test]
+    fn get_elements_by_class_name_follows_attribute_changes() {
+        let mut rt = setup_runtime(
+            "<html><body><p id='p1' class='x'>1</p><p id='p2'>2</p></body></html>",
+        );
+        let out = rt
+            .evaluate(
+                "(function(){var c=document.getElementsByClassName('x');var before=c.length;\
+                 document.getElementById('p2').className='x';var after=c.length;\
+                 document.getElementById('p1').removeAttribute('class');\
+                 return [before,after,c.length,c[0].id].join(',');})()",
+            )
+            .unwrap();
+        assert_eq!(out, serde_json::json!("1,2,1,p2"));
+    }
+
+    #[test]
+    fn get_elements_by_tag_name_ns_collection_is_live() {
+        let mut rt = setup_runtime(LIVE_FIXTURE);
+        let out = rt
+            .evaluate(
+                "(function(){var c=document.getElementsByTagNameNS('*','u');var before=c.length;\
+                 document.getElementById('dst').appendChild(document.createElement('u'));\
+                 return before+','+c.length;})()",
+            )
+            .unwrap();
+        assert_eq!(out, serde_json::json!("1,2"));
+    }
+
+    #[test]
+    fn query_selector_all_stays_static() {
+        // DOM 4.2.6 defines querySelectorAll as returning "the static result".
+        let mut rt = setup_runtime(LIVE_FIXTURE);
+        let out = rt
+            .evaluate(
+                "(function(){var q=document.querySelectorAll('i');var before=q.length;\
+                 document.getElementById('dst').appendChild(document.createElement('i'));\
+                 return before+','+q.length;})()",
+            )
+            .unwrap();
+        assert_eq!(out, serde_json::json!("1,1"), "querySelectorAll must not become live");
+    }
+
+    #[test]
+    fn live_collections_keep_item_named_access_and_enumeration() {
+        let mut rt = setup_runtime(
+            "<html><body><div id='src'><i id='kid' name='nm'>a</i><b>b</b></div></body></html>",
+        );
+        let out = rt
+            .evaluate(
+                "(function(){var u=document.getElementById('src');var c=u.children;\
+                 var byId=c['kid']===c[0];var named=c.namedItem('nm')===c[0];\
+                 var item=c.item(1)===c[1]&&c.item(9)===null;\
+                 var has=(1 in c)&&!(5 in c);\
+                 var spread=[...u.childNodes].length;\
+                 var forEach=0;u.childNodes.forEach(function(){forEach++;});\
+                 return [byId,named,item,has,spread,forEach].join(',');})()",
+            )
+            .unwrap();
+        assert_eq!(
+            out,
+            serde_json::json!("true,true,true,true,2,2"),
+            "named access, item(), `in`, spread and forEach must work through the live proxy"
+        );
+    }
 }

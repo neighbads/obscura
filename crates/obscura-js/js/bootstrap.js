@@ -866,14 +866,12 @@ function _splitAsciiWhitespace(s) {
 // tokens on ASCII whitespace, then return descendants (in tree order) whose
 // class attribute contains every token, as an HTMLCollection (so namedItem and
 // named access work on the result). `root` must expose querySelectorAll.
-function _getElementsByClassName(root, classNames) {
-  const tokens = _splitAsciiWhitespace(classNames);
-  if (tokens.length === 0) return HTMLCollection._from([]);
+const _matchClassNames = (root, tokens) => {
   // Fast path: a single CSS-identifier token goes straight to the native
   // selector engine (the common case). Only multi-token sets or exotic class
   // names (NBSP, leading digits, etc.) fall back to the O(n) JS scan below.
   if (tokens.length === 1 && /^[A-Za-z_-][\w-]*$/.test(tokens[0])) {
-    return HTMLCollection._from(root.querySelectorAll("." + tokens[0]));
+    return root.querySelectorAll("." + tokens[0]);
   }
   const all = root.querySelectorAll("*");
   const matched = [];
@@ -886,7 +884,16 @@ function _getElementsByClassName(root, classNames) {
     }
     if (ok) matched.push(el);
   }
-  return HTMLCollection._from(matched);
+  return matched;
+};
+function _getElementsByClassName(root, classNames) {
+  const tokens = _splitAsciiWhitespace(classNames);
+  // "If classes is the empty set, return an empty HTMLCollection" (DOM 4.9);
+  // that collection can never match anything, so it needs no live backing.
+  if (tokens.length === 0) return HTMLCollection._from([]);
+  // Live per DOM 4.9. Membership depends on the class attribute, not only on
+  // tree shape, so this collection tracks the attribute-inclusive epoch.
+  return _liveHTMLCollection(() => _matchClassNames(root, tokens), true);
 }
 let _consoleOid = 0;
 const _consoleObjectId = (value) => {
@@ -3868,7 +3875,8 @@ class Element extends Node {
     const ids = _domParse("query_selector_all_scoped", this._nid, s) || [];
     return _nodeList(ids.map(_wrapEl).filter(Boolean));
   }
-  getElementsByTagName(t) { return HTMLCollection._from(this.querySelectorAll(t)); }
+  // Live HTMLCollection per DOM 4.9 ("list of elements with qualified name").
+  getElementsByTagName(t) { return _liveHTMLCollection(() => this.querySelectorAll(t)); }
   getElementsByClassName(c) { return _getElementsByClassName(this, c); }
   matches(s) {
     // :popover-open is a JS-observable popover state, not understood by the
@@ -5710,7 +5718,8 @@ class Document extends Node {
     const ids = _domParse("query_selector_all", s) || [];
     return _nodeList(ids.map(_wrapEl).filter(Boolean));
   }
-  getElementsByTagName(t) { return HTMLCollection._from(this.querySelectorAll(t)); }
+  // Live HTMLCollection per DOM 4.5 ("list of elements with qualified name").
+  getElementsByTagName(t) { return _liveHTMLCollection(() => this.querySelectorAll(t)); }
   getElementsByClassName(c) { return _getElementsByClassName(this, c); }
   getElementsByName(name) { return this.querySelectorAll('[name="' + String(name).replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"]'); }
   evaluate(expression, contextNode, namespaceResolver, type, result) {
@@ -16553,46 +16562,33 @@ _markNative(Node.prototype.isDefaultNamespace);
 
 
 // ---- getElementsByTagNameNS on Element and Document ----
-// getElementsByTagNameNS on Element and Document
+// "list of elements with namespace namespace and local name localName"
+// (DOM 4.5 / 4.9), which is a live HTMLCollection.
+const _matchTagNameNS = (root, namespaceURI, localName) => {
+  const all = root.querySelectorAll('*');
+  const filtered = [];
+  const nsMatch = namespaceURI === '*';
+  const tagMatch = localName === '*';
+  for (let i = 0; i < all.length; i++) {
+    const el = all[i];
+    if (!el) continue;
+    const elNs = el.namespaceURI;
+    const elTag = el.localName;
+    const nsOk = nsMatch || (elNs === (namespaceURI || null));
+    const tagOk = tagMatch || (elTag === localName);
+    if (nsOk && tagOk) filtered.push(el);
+  }
+  return filtered;
+};
 if (!Element.prototype.getElementsByTagNameNS) {
   Element.prototype.getElementsByTagNameNS = function(namespaceURI, localName) {
-    const all = this.querySelectorAll('*');
-    const filtered = [];
-    const nsMatch = namespaceURI === '*';
-    const tagMatch = localName === '*';
-    for (let i = 0; i < all.length; i++) {
-      const el = all[i];
-      if (!el) continue;
-      const elNs = el.namespaceURI;
-      const elTag = el.localName;
-      const nsOk = nsMatch || (elNs === (namespaceURI || null));
-      const tagOk = tagMatch || (elTag === localName);
-      if (nsOk && tagOk) filtered.push(el);
-    }
-    const result = new HTMLCollection(...filtered);
-    result.item = (i) => result[i] != null ? result[i] : null;
-    return result;
+    return _liveHTMLCollection(() => _matchTagNameNS(this, namespaceURI, localName));
   };
   _markNative(Element.prototype.getElementsByTagNameNS);
 }
 if (!Document.prototype.getElementsByTagNameNS) {
   Document.prototype.getElementsByTagNameNS = function(namespaceURI, localName) {
-    const all = this.querySelectorAll('*');
-    const filtered = [];
-    const nsMatch = namespaceURI === '*';
-    const tagMatch = localName === '*';
-    for (let i = 0; i < all.length; i++) {
-      const el = all[i];
-      if (!el) continue;
-      const elNs = el.namespaceURI;
-      const elTag = el.localName;
-      const nsOk = nsMatch || (elNs === (namespaceURI || null));
-      const tagOk = tagMatch || (elTag === localName);
-      if (nsOk && tagOk) filtered.push(el);
-    }
-    const result = new HTMLCollection(...filtered);
-    result.item = (i) => result[i] != null ? result[i] : null;
-    return result;
+    return _liveHTMLCollection(() => _matchTagNameNS(this, namespaceURI, localName));
   };
   _markNative(Document.prototype.getElementsByTagNameNS);
 }

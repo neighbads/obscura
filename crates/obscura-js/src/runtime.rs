@@ -22579,4 +22579,51 @@ mod tests {
             "a valid selector referencing an unimplemented pseudo-class must return empty/false, not throw"
         );
     }
+
+    // ---- getElementsByName matches only HTML elements (R-58) --------------
+    // HTML 3.1.5: "all the HTML elements in that document that have a name
+    // attribute" — an attribute-selector implementation alone also matches
+    // same-named elements in foreign namespaces (SVG/MathML).
+
+    #[test]
+    fn get_elements_by_name_matches_only_html_elements() {
+        let mut rt = setup_runtime("<html><body><div id='dst'><input name='x'></div></body></html>");
+        let out = rt
+            .evaluate(
+                "(function(){var d=document.getElementById('dst');\
+                 var svg=document.createElementNS('http://www.w3.org/2000/svg','rect');\
+                 svg.setAttribute('name','x');\
+                 d.appendChild(svg);\
+                 return [document.getElementsByName('x').length,\
+                 document.getElementsByName('x')[0].namespaceURI].join(',');})()",
+            )
+            .unwrap();
+        assert_eq!(
+            out,
+            serde_json::json!("1,http://www.w3.org/1999/xhtml"),
+            "getElementsByName must not match a same-named element outside the HTML namespace"
+        );
+    }
+
+    #[test]
+    fn dom_parser_document_get_elements_by_name_matches_only_html_elements() {
+        // The foreign <rect name="x"> is reached through HTML foreign-content
+        // parsing (not createElementNS, whose DOMParser-shim implementation
+        // has its own pre-existing, out-of-scope namespace bug) so it lands
+        // in the SVG namespace the same way a real page's markup would.
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let out = rt
+            .evaluate(
+                "(function(){var d=new DOMParser().parseFromString(\
+                 '<html><body><input name=\\'x\\'><svg><rect name=\\'x\\'></rect></svg></body></html>',\
+                 'text/html');\
+                 return d.getElementsByName('x').length + '';})()",
+            )
+            .unwrap();
+        assert_eq!(
+            out,
+            serde_json::json!("1"),
+            "the DOMParser document shim's getElementsByName must also be HTML-elements-only"
+        );
+    }
 }

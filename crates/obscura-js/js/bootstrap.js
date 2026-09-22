@@ -5808,10 +5808,12 @@ class Document extends Node {
   // "Returns a live NodeList containing all the HTML elements in that document
   // that have a name attribute whose value is identical to elementName"
   // (HTML 3.1.5). Membership follows the name attribute, so this tracks the
-  // attribute-inclusive epoch rather than tree shape alone.
+  // attribute-inclusive epoch rather than tree shape alone. The attribute
+  // selector alone would also match same-named elements in foreign
+  // namespaces (SVG/MathML), so the HTML-namespace check is applied after.
   getElementsByName(name) {
     const selector = '[name="' + String(name).replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"]';
-    return _liveNodeList(() => this.querySelectorAll(selector), true);
+    return _liveNodeList(() => Array.prototype.filter.call(this.querySelectorAll(selector), _isHTMLEl), true);
   }
   evaluate(expression, contextNode, namespaceResolver, type, result) {
     return _makeXPathResult(type, _xpathFindNodes(expression, contextNode || this));
@@ -11425,7 +11427,7 @@ globalThis.DOMParser = class DOMParser {
       },
       getElementsByName(n) {
         const selector = `[name="${n}"]`;
-        return _liveNodeList(() => root.querySelectorAll(selector), true);
+        return _liveNodeList(() => Array.prototype.filter.call(root.querySelectorAll(selector), _isHTMLEl), true);
       },
       createElement: (t) => document.createElement(t),
       createElementNS: (ns, t) => document.createElement(t),

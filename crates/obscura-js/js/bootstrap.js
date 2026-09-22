@@ -862,10 +862,9 @@ function _splitAsciiWhitespace(s) {
   // WebIDL DOMString coercion: null -> "null", undefined -> "undefined".
   return String(s).split(_ASCII_WS).filter(Boolean);
 }
-// Shared getElementsByClassName: split the argument into an ordered set of
-// tokens on ASCII whitespace, then return descendants (in tree order) whose
-// class attribute contains every token, as an HTMLCollection (so namedItem and
-// named access work on the result). `root` must expose querySelectorAll.
+// Descendants of `root` (in tree order) whose class attribute contains every
+// token. `root` must expose querySelectorAll. This is the query half of
+// getElementsByClassName, kept separate so a live collection can re-run it.
 const _matchClassNames = (root, tokens) => {
   // Fast path: a single CSS-identifier token goes straight to the native
   // selector engine (the common case). Only multi-token sets or exotic class
@@ -886,6 +885,9 @@ const _matchClassNames = (root, tokens) => {
   }
   return matched;
 };
+// Shared getElementsByClassName: split the argument into an ordered set of
+// tokens on ASCII whitespace, then expose the matches as an HTMLCollection (so
+// namedItem and named access work on the result).
 function _getElementsByClassName(root, classNames) {
   const tokens = _splitAsciiWhitespace(classNames);
   // "If classes is the empty set, return an empty HTMLCollection" (DOM 4.9);

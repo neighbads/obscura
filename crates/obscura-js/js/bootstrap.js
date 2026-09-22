@@ -12664,10 +12664,13 @@ function _nodeList(els) {
 // _treeMutationEpoch covers structural changes. Class-name collections also
 // depend on the class attribute, so those track _domMutationEpoch, which counts
 // attribute writes as well.
+// True when the snapshot predates the current epoch. Kept separate from the
+// re-query so the traps can inline the check: the overwhelmingly common case
+// is a hit, and a call into _liveRefresh on every property read costs more
+// than the comparison it guards.
+const _liveStale = (t) => t._liveEpoch !== (t._liveAttrs ? _domMutationEpoch : _treeMutationEpoch);
 const _liveRefresh = (target) => {
-  const epoch = target._liveAttrs ? _domMutationEpoch : _treeMutationEpoch;
-  if (target._liveEpoch === epoch) return target;
-  target._liveEpoch = epoch;
+  target._liveEpoch = target._liveAttrs ? _domMutationEpoch : _treeMutationEpoch;
   const next = target._liveQuery();
   const n = next.length;
   const prev = target.length;
@@ -12677,27 +12680,34 @@ const _liveRefresh = (target) => {
   return target;
 };
 // Traps refresh before delegating, so length, integer indices, item(),
-// iteration, `in` and Object.keys all observe the current tree.
+// iteration, `in` and Object.keys all observe the current tree. The get trap
+// reads straight off the target rather than going through Reflect.get with the
+// proxy as receiver: no property here is an accessor that needs the proxy as
+// `this`, and a method read through the trap is still invoked with the proxy
+// as its call receiver, so the binding is unchanged and the read is far
+// cheaper. This is the hot path of every live traversal.
 const _liveNodeListProxy = {
-  get(t, k, r) { return Reflect.get(_liveRefresh(t), k, r); },
-  has(t, k) { return Reflect.has(_liveRefresh(t), k); },
-  ownKeys(t) { return Reflect.ownKeys(_liveRefresh(t)); },
-  getOwnPropertyDescriptor(t, k) { return Reflect.getOwnPropertyDescriptor(_liveRefresh(t), k); },
+  get(t, k) { if (_liveStale(t)) _liveRefresh(t); return t[k]; },
+  has(t, k) { if (_liveStale(t)) _liveRefresh(t); return k in t; },
+  ownKeys(t) { if (_liveStale(t)) _liveRefresh(t); return Reflect.ownKeys(t); },
+  getOwnPropertyDescriptor(t, k) { if (_liveStale(t)) _liveRefresh(t); return Reflect.getOwnPropertyDescriptor(t, k); },
 };
 // Same, plus the lazy named access an HTMLCollection owes its supported
 // property names (identical fallback to the static _htmlCollectionProxy).
 const _liveHTMLCollectionProxy = {
-  get(t, k, r) {
-    const v = Reflect.get(_liveRefresh(t), k, r);
+  get(t, k) {
+    if (_liveStale(t)) _liveRefresh(t);
+    const v = t[k];
     if (v !== undefined || typeof k !== "string") return v;
     return t.namedItem ? (t.namedItem(k) || undefined) : undefined;
   },
   has(t, k) {
-    if (Reflect.has(_liveRefresh(t), k)) return true;
+    if (_liveStale(t)) _liveRefresh(t);
+    if (k in t) return true;
     return typeof k === "string" && !!(t.namedItem && t.namedItem(k));
   },
-  ownKeys(t) { return Reflect.ownKeys(_liveRefresh(t)); },
-  getOwnPropertyDescriptor(t, k) { return Reflect.getOwnPropertyDescriptor(_liveRefresh(t), k); },
+  ownKeys(t) { if (_liveStale(t)) _liveRefresh(t); return Reflect.ownKeys(t); },
+  getOwnPropertyDescriptor(t, k) { if (_liveStale(t)) _liveRefresh(t); return Reflect.getOwnPropertyDescriptor(t, k); },
 };
 // The three backing slots are non-enumerable so Object.keys / JSON.stringify
 // still see only the indices and length a real collection exposes.

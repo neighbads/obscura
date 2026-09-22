@@ -1311,12 +1311,47 @@ fn op_shadow_attach(
         _ => return -1,
     };
     let shared = frame_state(state, frame_id);
-    let state = shared.borrow();
-    let Some(dom) = state.dom.as_ref() else {
-        return -1;
+    let mut state = shared.borrow_mut();
+    attach_shadow_root_invalidating(&mut state, NodeId::new(host_nid), mode)
+}
+
+/// `attachShadow` replaces the host's rendered children without going through
+/// any DOM mutation command, so nothing else drops the cached render. Without
+/// this the light children keep generating boxes until an unrelated mutation
+/// happens to invalidate the document.
+fn attach_shadow_root_invalidating(
+    state: &mut ObscuraState,
+    host: NodeId,
+    mode: ShadowRootMode,
+) -> i32 {
+    let attached = {
+        let Some(dom) = state.dom.as_ref() else {
+            return -1;
+        };
+        #[cfg(feature = "render")]
+        let connected = node_is_connected(dom, host);
+        let result = dom.attach_shadow_root(host, mode);
+        #[cfg(feature = "render")]
+        {
+            (connected, result)
+        }
+        #[cfg(not(feature = "render"))]
+        {
+            result
+        }
     };
-    match dom.attach_shadow_root(NodeId::new(host_nid), mode) {
-        Ok(root) => root.raw() as i32,
+    #[cfg(feature = "render")]
+    let (connected, attached) = attached;
+    match attached {
+        Ok(root) => {
+            #[cfg(feature = "render")]
+            if connected {
+                state.prepared_render = None;
+                state.pending_style_mutations.clear();
+                state.resolved_scroll = None;
+            }
+            root.raw() as i32
+        }
         Err(AttachShadowError::HostAlreadyHasShadowRoot) => -2,
         Err(_) => -1,
     }
@@ -4719,6 +4754,52 @@ mod tests {
         assert_eq!(
             super::posted_task_owner_status(&weak),
             super::PostedTaskOwnerStatus::Gone,
+        );
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn attaching_a_shadow_root_invalidates_the_cached_render() {
+        // R-44: attachShadow stops the host's unslotted light children from
+        // generating boxes, but it produces no DOM mutation command, so nothing
+        // used to drop `prepared_render`. The stale render kept painting the
+        // light child until an unrelated mutation arrived.
+        let dom = parse_html(
+            r#"<html><body><x-card id="host" style="display:block"><div id="light" style="height:9px"></div></x-card></body></html>"#,
+        );
+        let host = dom.get_element_by_id("host").unwrap();
+        let light = dom.get_element_by_id("light").unwrap();
+        let mut state = ObscuraState::new();
+        state.dom = Some(dom);
+
+        let light_had_box = ensure_prepared_render(&mut state)
+            .expect("initial render")
+            .layout()
+            .rects
+            .contains_key(&light);
+        assert!(
+            light_had_box,
+            "the light child generates a box before the shadow root exists"
+        );
+
+        assert!(
+            super::attach_shadow_root_invalidating(
+                &mut state,
+                host,
+                ShadowRootMode::Open,
+            ) >= 0,
+            "attach must succeed"
+        );
+
+        let light_still_has_box = ensure_prepared_render(&mut state)
+            .expect("render after attachShadow")
+            .layout()
+            .rects
+            .contains_key(&light);
+        assert!(
+            !light_still_has_box,
+            "an unslotted light child must stop generating boxes as soon as the \
+             shadow root is attached, without waiting for an unrelated mutation"
         );
     }
 

@@ -140,10 +140,7 @@ impl FrameRealm {
         self.execute_script(
             parent,
             "globalThis.__obscura_setDocumentReadyState('interactive');\
-             try { document.dispatchEvent(new Event('DOMContentLoaded', \
-                 { bubbles: false, cancelable: false })); } catch (_) {}\
-             try { window.dispatchEvent(new Event('DOMContentLoaded', \
-                 { bubbles: false, cancelable: false })); } catch (_) {}\
+             try { globalThis.__obscura_fireDomContentLoaded(); } catch (_) {}\
              globalThis.__obscura_setDocumentReadyState('complete');\
              try { globalThis.__obscura_fireWindowLoad(); } catch (_) {}",
         )

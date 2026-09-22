@@ -5938,6 +5938,95 @@ mod tests {
         assert_eq!(result, serde_json::json!(["SyntaxError", true]));
     }
 
+    // R-48 — `performance.measure(name, 'navigationStart', ...)` threw
+    // SyntaxError because the resolver only ever consulted the page's own
+    // marks. User Timing Level 3 §3.1 step 1 resolves a PerformanceTiming
+    // attribute name first, and §3.2 makes navigationStart the time origin,
+    // i.e. 0. Every Next.js bundle runs this measure from the layout effect
+    // that commits hydration, so the throw took the whole React root down.
+    #[test]
+    fn performance_measure_accepts_navigation_start_without_a_mark() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(function(){
+                    try {
+                        performance.mark("beforeRender");
+                        var m = performance.measure("Next.js-before-hydration", "navigationStart", "beforeRender");
+                        return [m.name, m.entryType, m.startTime, m.duration >= 0];
+                    } catch (e) {
+                        return ["threw", e.name, e.message, false];
+                    }
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!(["Next.js-before-hydration", "measure", 0, true])
+        );
+    }
+
+    // §3.1 step 1 runs before step 2: the PerformanceTiming name wins even
+    // when the page has marked the same name itself.
+    #[test]
+    fn performance_timing_name_outranks_a_page_mark_of_the_same_name() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(function(){
+                    performance.mark("navigationStart", { startTime: 1234 });
+                    return [
+                        performance.measure("m", "navigationStart").startTime,
+                        performance.getEntriesByName("navigationStart", "mark").length,
+                    ];
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!([0, 1]));
+    }
+
+    // §3.2 step 5: a PerformanceTiming attribute still reading 0 means the
+    // event has not happened, which is an InvalidAccessError — not the
+    // SyntaxError reserved for a name that is no attribute and no mark.
+    #[test]
+    fn performance_measure_rejects_a_navigation_timing_event_that_has_not_happened() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(function(){
+                    try {
+                        performance.measure("m", "domComplete");
+                        return "no-throw";
+                    } catch (e) {
+                        return [e.name, e.message.indexOf("'domComplete' is empty") !== -1];
+                    }
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!(["InvalidAccessError", true]));
+    }
+
+    // Once the readiness change has actually happened the same name resolves,
+    // relative to navigationStart rather than to the epoch.
+    #[test]
+    fn performance_measure_resolves_a_recorded_navigation_timing_event() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(function(){
+                    globalThis.__obscura_setDocumentReadyState('complete');
+                    var start = performance.measure("m", "domComplete").startTime;
+                    return [
+                        performance.timing.domComplete > 0,
+                        start > 0 && start < 60000,
+                        Object.keys(performance.timing).length,
+                    ];
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!([true, true, 21]));
+    }
+
     #[test]
     fn performance_clear_marks_and_get_entries_reflect_removal() {
         let mut rt = setup_runtime("<html><body></body></html>");

@@ -3051,8 +3051,7 @@ impl Page {
             // a DOMContentLoaded listener.
             let _ = js.execute_script(
                 "<dom-content-loaded>",
-                "try { document.dispatchEvent(new Event('DOMContentLoaded', {bubbles:false,cancelable:false})); } catch(e) {}\n\
-                 try { window.dispatchEvent(new Event('DOMContentLoaded', {bubbles:false,cancelable:false})); } catch(e) {}",
+                "try { globalThis.__obscura_fireDomContentLoaded(); } catch(e) {}",
             );
 
             // Parser images finish after DOMContentLoaded and before the load

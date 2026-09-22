@@ -33,7 +33,8 @@ const __obscuraCore = globalThis.Deno.core;
     '__obscura_nextPendingTimeoutDelay',
     '__obscura_hw', '__obscura_mem',
     '__documentReadyState__', '__obscura_setDocumentReadyState',
-    '__obscura_fireWindowLoad', '__obscura_fireScriptResourceEvent',
+    '__obscura_fireWindowLoad', '__obscura_fireDomContentLoaded',
+    '__obscura_fireScriptResourceEvent',
     '__obscura_fireParserImageEvents', '__currentUrl',
     // internal helpers (var-declared throughout the file)
     '__processDynScriptQueue', '_decodeDataScriptUrl', '_markNative', '_fpRand', '_fpNoise',
@@ -180,6 +181,7 @@ globalThis.__obscura_fireParserImageEvents = function() {
 // legacy target override flag set, which per DOM dispatch makes the event's
 // target the Document rather than the Window.
 globalThis.__obscura_fireWindowLoad = function() {
+  _recordNavigationTiming('loadEventStart');
   const event = new Event('load', { bubbles: false, cancelable: false });
   event.target = globalThis.document || null;
   if (typeof globalThis.onload === 'function') {
@@ -190,6 +192,19 @@ globalThis.__obscura_fireWindowLoad = function() {
     event.eventPhase = 0;
   }
   try { globalThis.dispatchEvent(event); } catch (e) { console.error(e); }
+  _recordNavigationTiming('loadEventEnd');
+};
+
+// HTML "the end" step 4: fire `DOMContentLoaded` at the Document, bracketed by
+// the two PerformanceTiming attributes that record it. Both the page document
+// (page.rs) and a frame document (frame.rs) reach the event through here so
+// the pair is recorded exactly once, in order, either way.
+globalThis.__obscura_fireDomContentLoaded = function() {
+  _recordNavigationTiming('domContentLoadedEventStart');
+  const init = { bubbles: false, cancelable: false };
+  try { globalThis.document.dispatchEvent(new Event('DOMContentLoaded', init)); } catch (e) {}
+  try { globalThis.dispatchEvent(new Event('DOMContentLoaded', init)); } catch (e) {}
+  _recordNavigationTiming('domContentLoadedEventEnd');
 };
 
 // HTML "update the current document readiness": set the readiness, then fire
@@ -199,6 +214,11 @@ globalThis.__obscura_fireWindowLoad = function() {
 globalThis.__obscura_setDocumentReadyState = function(state) {
   const previous = globalThis.__documentReadyState__;
   if (previous === state) return;
+  // PerformanceTiming records the instant immediately before each readiness
+  // change, so take it before the state moves.
+  if (state === 'loading') _recordNavigationTiming('domLoading');
+  else if (state === 'interactive') _recordNavigationTiming('domInteractive');
+  else if (state === 'complete') _recordNavigationTiming('domComplete');
   globalThis.__documentReadyState__ = state;
   if (previous === undefined) return;
   try {
@@ -11235,11 +11255,68 @@ globalThis.XMLSerializer = class XMLSerializer {
 // and never progressed past that check.
 let __perfEntries = [];
 
+// The 21 read-only attributes of the PerformanceTiming interface
+// (Navigation Timing Level 1 §4.2). User Timing Level 3 §3.1 "convert a mark
+// to a timestamp" resolves a DOMString start/end against this list *first*,
+// ahead of the page's own marks, which is what makes
+// `performance.measure(n, 'navigationStart', m)` — run by every Next.js
+// bundle once hydration commits — legal without a prior performance.mark().
+const _PERFORMANCE_TIMING_NAMES = [
+  "navigationStart", "unloadEventStart", "unloadEventEnd",
+  "redirectStart", "redirectEnd", "fetchStart",
+  "domainLookupStart", "domainLookupEnd", "connectStart", "connectEnd",
+  "secureConnectionStart", "requestStart", "responseStart", "responseEnd",
+  "domLoading", "domInteractive",
+  "domContentLoadedEventStart", "domContentLoadedEventEnd",
+  "domComplete", "loadEventStart", "loadEventEnd",
+];
+
+// A PerformanceTiming record for one navigation. Every attribute starts at 0,
+// which is how the interface reports "this event did not happen" — the
+// navigation phases the engine does observe overwrite their own slot as they
+// occur, and the ones it never measures stay 0 rather than claim a time.
+function _newPerformanceTiming(navigationStart) {
+  const timing = {};
+  for (const name of _PERFORMANCE_TIMING_NAMES) timing[name] = 0;
+  timing.navigationStart = navigationStart;
+  // Navigation Timing Level 1: with no previous document to prompt-to-unload,
+  // navigationStart returns the same value as fetchStart.
+  timing.fetchStart = navigationStart;
+  return timing;
+}
+
+// PerformanceTiming attributes are epoch milliseconds, not performance.now()
+// offsets.
+function _recordNavigationTiming(name) {
+  const timing = globalThis.performance && globalThis.performance.timing;
+  if (timing) timing[name] = Date.now();
+}
+
+// User Timing Level 3 §3.2 "convert a name to a timestamp".
+function _perfConvertNameToTimestamp(name, method) {
+  if (name === "navigationStart") return 0;
+  const timing = globalThis.performance.timing || {};
+  const endTime = timing[name] || 0;
+  if (endTime === 0) {
+    throw new DOMException(
+      "Failed to execute '" + method + "' on 'Performance': '" + name +
+        "' is empty: either the event hasn't happened yet, or it would " +
+        "provide cross-origin timing information.",
+      "InvalidAccessError"
+    );
+  }
+  return endTime - (timing.navigationStart || 0);
+}
+
 function _perfResolveMarkTime(ref, method) {
   if (typeof ref === "number") return ref;
   const name = String(ref);
-  // Per spec: the most recently created entry with this name, mark or
-  // measure alike.
+  // §3.1 step 1: a PerformanceTiming attribute name reads off the navigation
+  // timeline and outranks a page mark that happens to share the name.
+  if (_PERFORMANCE_TIMING_NAMES.includes(name)) {
+    return _perfConvertNameToTimestamp(name, method);
+  }
+  // §3.1 step 2: otherwise the most recently created entry with this name.
   for (let i = __perfEntries.length - 1; i >= 0; i--) {
     if (__perfEntries[i].name === name) return __perfEntries[i].startTime;
   }
@@ -11318,7 +11395,7 @@ globalThis.performance = globalThis.performance || {
   },
   setResourceTimingBufferSize(){},
   timeOrigin: 0,
-  timing: { navigationStart: 0, domContentLoadedEventEnd: 0, loadEventEnd: 0 },
+  timing: _newPerformanceTiming(0),
   navigation: { type: 0, redirectCount: 0 },
   memory: {
     jsHeapSizeLimit: 4294705152,
@@ -16459,7 +16536,7 @@ globalThis.__obscura_init = function() {
   // origin ahead of it makes performance.now() and the rAF timestamp negative.
   const t0 = Date.now() - 1 - Math.floor(_fpRand(641) * 100);
   globalThis.performance.timeOrigin = t0;
-  globalThis.performance.timing = { navigationStart: t0, domContentLoadedEventEnd: t0, loadEventEnd: t0 };
+  globalThis.performance.timing = _newPerformanceTiming(t0);
   var _totalHeap = 15000000 + Math.floor(_fpRand(620) * 85000000);
   globalThis.performance.memory = {
     jsHeapSizeLimit: 4294705152,

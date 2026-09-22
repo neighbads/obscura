@@ -2381,8 +2381,15 @@ class Node extends EventTarget {
   }
   get parentElement() { const p = this.parentNode; return p && p.nodeType === 1 ? p : null; }
   get childNodes() {
-    const ids = _domParse("child_nodes", this._nid) || [];
-    return _nodeList(ids.map(_wrap).filter(Boolean));
+    // Live NodeList per DOM 4.4, and one object per node: `node.childNodes ===
+    // node.childNodes` is observable and every engine holds a single instance.
+    let list = this._childNodesList;
+    if (!list) {
+      const nid = this._nid;
+      list = _liveNodeList(() => (_domParse("child_nodes", nid) || []).map(_wrap).filter(Boolean));
+      Object.defineProperty(this, "_childNodesList", { value: list });
+    }
+    return list;
   }
   get firstChild() { return _wrap(+_dom("first_child", this._nid)); }
   get lastChild() { return _wrap(+_dom("last_child", this._nid)); }
@@ -2577,14 +2584,17 @@ class Node extends EventTarget {
       if (src.localName === 'template' && dst.localName === 'template') {
         const sc = src.content, dc = dst.content;
         if (sc && dc && sc.childNodes) {
-          const tk = sc.childNodes;
+          // Snapshot: childNodes is live, and the appendChild below would make
+          // every length read re-query the source fragment.
+          const tk = Array.from(sc.childNodes);
           for (let i = 0; i < tk.length; i++) {
             const c = _shallowCloneNode(tk[i]);
             if (c) { dc.appendChild(c); stack.push([tk[i], c]); }
           }
         }
       }
-      const kids = src.childNodes;
+      // Snapshot for the same reason as the template branch above.
+      const kids = Array.from(src.childNodes);
       for (let i = 0; i < kids.length; i++) {
         const c = _shallowCloneNode(kids[i]);
         if (c) { dst.appendChild(c); stack.push([kids[i], c]); }
@@ -3652,8 +3662,14 @@ class Element extends Node {
   get innerText() { return _domParse("inner_text", this._nid) ?? ""; }
   set innerText(v) { this.textContent = v; }
   get children() {
-    const ids = _domParse("element_children", this._nid) || [];
-    return HTMLCollection._from(ids.map(_wrapEl).filter(Boolean));
+    // Live HTMLCollection per DOM 4.2.6, one object per element.
+    let list = this._childrenList;
+    if (!list) {
+      const nid = this._nid;
+      list = _liveHTMLCollection(() => (_domParse("element_children", nid) || []).map(_wrapEl).filter(Boolean));
+      Object.defineProperty(this, "_childrenList", { value: list });
+    }
+    return list;
   }
   get content() {
     // <template>.content is a DocumentFragment; <meta>.content reflects
@@ -5575,8 +5591,14 @@ class Document extends Node {
   }
   get documentElement() { return _wrapEl(+_dom("document_element")); }
   get children() {
-    const root = this.documentElement;
-    return HTMLCollection._from(root ? [root] : []);
+    // Live HTMLCollection per DOM 4.2.6; a document's only element child is
+    // its document element, so the query is just that lookup.
+    let list = this._childrenList;
+    if (!list) {
+      list = _liveHTMLCollection(() => { const root = this.documentElement; return root ? [root] : []; });
+      Object.defineProperty(this, "_childrenList", { value: list });
+    }
+    return list;
   }
   get childElementCount() { return this.documentElement ? 1 : 0; }
   get firstElementChild() { return this.documentElement; }
@@ -6254,8 +6276,14 @@ class DocumentFragment extends Node {
     return _nodeList(ids.map(_wrapEl).filter(Boolean));
   }
   get children() {
-    const ids = _domParse("element_children", this._nid) || [];
-    return HTMLCollection._from(ids.map(_wrapEl).filter(Boolean));
+    // Live HTMLCollection per DOM 4.2.6, one object per fragment.
+    let list = this._childrenList;
+    if (!list) {
+      const nid = this._nid;
+      list = _liveHTMLCollection(() => (_domParse("element_children", nid) || []).map(_wrapEl).filter(Boolean));
+      Object.defineProperty(this, "_childrenList", { value: list });
+    }
+    return list;
   }
   get firstElementChild() { return this.children[0] || null; }
   get lastElementChild() { const ch = this.children; return ch[ch.length - 1] || null; }
@@ -12590,14 +12618,92 @@ const _htmlCollectionProxy = {
 function _isHTMLEl(el) {
   return !!el && (el.namespaceURI === undefined || el.namespaceURI === "http://www.w3.org/1999/xhtml");
 }
-// Build a NodeList (no named access, per spec) for querySelectorAll and
-// childNodes. Kept light on purpose: querySelectorAll is the hottest query API.
+// Build a static NodeList (no named access, per spec) for querySelectorAll and
+// the other snapshot-returning APIs. Kept light on purpose: querySelectorAll is
+// the hottest query API, and DOM 4.2.6 defines its method steps as returning
+// "the static result of running scope-match a selectors string", so it must
+// stay a snapshot.
 function _nodeList(els) {
   const nl = new NodeList();
   for (let i = 0; i < els.length; i++) nl[i] = els[i];
   nl.length = els.length;
   return nl;
 }
+
+// ---- Live collections -----------------------------------------------------
+// DOM 4.2.10: "A collection can be either live or static. Unless otherwise
+// stated, a collection must be live. If a collection is live, then the
+// attributes and methods on that object must operate on the actual underlying
+// data, not a snapshot of the data."
+//
+// Live by spec, and live here:
+//   childNodes              NodeList rooted at this matching only children (4.4)
+//   children                HTMLCollection rooted at this matching only
+//                           element children (4.2.6)
+//   getElementsByTagName    "list of elements with qualified name" (4.5, 4.9)
+//   getElementsByTagNameNS  "list of elements with namespace ..." (4.5, 4.9)
+//   getElementsByClassName  "list of elements with class names" (4.5, 4.9)
+// Static by spec, and deliberately left alone: querySelectorAll (4.2.6).
+//
+// Liveness without one DOM op per property access: the collection keeps a
+// snapshot together with the mutation epoch it was taken at, and re-runs its
+// query only when that epoch has moved. A read-only traversal therefore costs
+// one op no matter how many indices it touches, while a loop that mutates
+// between reads re-queries once per mutation - which is what makes the standard
+// drain idiom terminate:
+//   for (f = node.childNodes; f.length;) frag.appendChild(f[0]);
+// _treeMutationEpoch covers structural changes. Class-name collections also
+// depend on the class attribute, so those track _domMutationEpoch, which counts
+// attribute writes as well.
+const _liveRefresh = (target) => {
+  const epoch = target._liveAttrs ? _domMutationEpoch : _treeMutationEpoch;
+  if (target._liveEpoch === epoch) return target;
+  target._liveEpoch = epoch;
+  const next = target._liveQuery();
+  const n = next.length;
+  const prev = target.length;
+  for (let i = 0; i < n; i++) target[i] = next[i];
+  for (let i = n; i < prev; i++) delete target[i];
+  target.length = n;
+  return target;
+};
+// Traps refresh before delegating, so length, integer indices, item(),
+// iteration, `in` and Object.keys all observe the current tree.
+const _liveNodeListProxy = {
+  get(t, k, r) { return Reflect.get(_liveRefresh(t), k, r); },
+  has(t, k) { return Reflect.has(_liveRefresh(t), k); },
+  ownKeys(t) { return Reflect.ownKeys(_liveRefresh(t)); },
+  getOwnPropertyDescriptor(t, k) { return Reflect.getOwnPropertyDescriptor(_liveRefresh(t), k); },
+};
+// Same, plus the lazy named access an HTMLCollection owes its supported
+// property names (identical fallback to the static _htmlCollectionProxy).
+const _liveHTMLCollectionProxy = {
+  get(t, k, r) {
+    const v = Reflect.get(_liveRefresh(t), k, r);
+    if (v !== undefined || typeof k !== "string") return v;
+    return t.namedItem ? (t.namedItem(k) || undefined) : undefined;
+  },
+  has(t, k) {
+    if (Reflect.has(_liveRefresh(t), k)) return true;
+    return typeof k === "string" && !!(t.namedItem && t.namedItem(k));
+  },
+  ownKeys(t) { return Reflect.ownKeys(_liveRefresh(t)); },
+  getOwnPropertyDescriptor(t, k) { return Reflect.getOwnPropertyDescriptor(_liveRefresh(t), k); },
+};
+// The three backing slots are non-enumerable so Object.keys / JSON.stringify
+// still see only the indices and length a real collection exposes.
+const _defineLiveState = (target, query, attrSensitive) => {
+  Object.defineProperty(target, "_liveQuery", { value: query });
+  Object.defineProperty(target, "_liveAttrs", { value: !!attrSensitive });
+  Object.defineProperty(target, "_liveEpoch", { value: -1, writable: true });
+  return target;
+};
+// The first fill is eager so an invalid argument still throws from the call
+// that created the collection rather than from some later property read.
+const _liveNodeList = (query) =>
+  new Proxy(_liveRefresh(_defineLiveState(new NodeList(), query, false)), _liveNodeListProxy);
+const _liveHTMLCollection = (query, attrSensitive) =>
+  new Proxy(_liveRefresh(_defineLiveState(new HTMLCollection(), query, attrSensitive)), _liveHTMLCollectionProxy);
 
 // Window named access. HTML exposes every element id, plus the name of a
 // small legacy set of HTML elements, as properties of the WindowProxy. V8's

@@ -22419,4 +22419,69 @@ mod tests {
             "getElementsByTagName must stay live after the matching rewrite"
         );
     }
+
+    // ---- createElementNS does not fold case in the HTML namespace (R-51) --
+    // DOM 4.5: createElementNS's "create an element" steps never fold case;
+    // only createElement()/the HTML parser lowercase for HTML documents.
+
+    #[test]
+    fn create_element_ns_html_namespace_preserves_case() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let out = rt
+            .evaluate(
+                "(function(){var e=document.createElementNS('http://www.w3.org/1999/xhtml','FooBar');\
+                 return [e.localName,e.tagName,e.namespaceURI].join(',');})()",
+            )
+            .unwrap();
+        assert_eq!(
+            out,
+            serde_json::json!("FooBar,FOOBAR,http://www.w3.org/1999/xhtml"),
+            "createElementNS must not lowercase the local name in the HTML namespace"
+        );
+    }
+
+    #[test]
+    fn create_element_ns_html_namespace_enables_r47_uppercase_miss() {
+        // Regression coverage for R-47: before R-51 was fixed, createElementNS
+        // in the HTML namespace always lowercased its argument, so an
+        // HTML-namespace element with an uppercase local name could never be
+        // constructed, and the DOM spec's "matches <foo>, never <FOO>" clause
+        // (getElementsByTagName, "list of elements with qualified name") was
+        // untestable. Neither 'foo' nor 'FOO' can ever match a stored local
+        // name of "FOO", since the argument is lowercased before comparison —
+        // so both queries below must land on the lowercase-created element.
+        let mut rt = setup_runtime("<html><body><div id='dst'></div></body></html>");
+        let out = rt
+            .evaluate(
+                "(function(){var d=document.getElementById('dst');\
+                 d.appendChild(document.createElement('foo'));\
+                 d.appendChild(document.createElementNS('http://www.w3.org/1999/xhtml','FOO'));\
+                 return [d.getElementsByTagName('foo').length,\
+                 d.getElementsByTagName('FOO').length,\
+                 d.getElementsByTagName('foo')[0].localName].join(',');})()",
+            )
+            .unwrap();
+        assert_eq!(
+            out,
+            serde_json::json!("1,1,foo"),
+            "getElementsByTagName must match only the lowercase html:foo element, never html:FOO"
+        );
+    }
+
+    #[test]
+    fn create_element_ns_html_namespace_still_upgrades_custom_elements() {
+        // The unprefixed HTML-namespace path in createElementNS reuses
+        // createElement's internal-creation steps (custom element upgrade);
+        // confirm the refactor that dropped the lowercase fold kept that.
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let out = rt
+            .evaluate(
+                "(function(){\
+                 customElements.define('x-widget', class extends HTMLElement {});\
+                 var e=document.createElementNS('http://www.w3.org/1999/xhtml','x-widget');\
+                 return e instanceof customElements.get('x-widget');})()",
+            )
+            .unwrap();
+        assert_eq!(out, serde_json::json!(true));
+    }
 }

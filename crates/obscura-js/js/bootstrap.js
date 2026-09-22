@@ -5802,7 +5802,17 @@ class Document extends Node {
     return _makeXPathResult(type, _xpathFindNodes(expression, contextNode || this));
   }
   createElement(t) {
-    const localName = String(t).toLowerCase();
+    // "If this is an HTML document, then set localName to localName in ASCII
+    // lowercase" (DOM 4.5 createElement) — this fold is specific to this
+    // method, not to element creation in general; createElementNS must not
+    // repeat it (see _createElementInternal below).
+    return this._createElementInternal(String(t).toLowerCase());
+  }
+  // Shared "create an element" internal steps (DOM 4.5) for the HTML
+  // namespace, used by both createElement (localName already folded to
+  // lowercase by the caller above) and createElementNS's unprefixed
+  // HTML-namespace path (localName passed through verbatim, per spec).
+  _createElementInternal(localName) {
     const nid = +_dom("create_element", localName);
     const C = _elementClassForKnownName(
       "http://www.w3.org/1999/xhtml",
@@ -5830,8 +5840,15 @@ class Document extends Node {
     const namespace = ns == null ? null : String(ns);
     const qualified = String(t);
     _ns_validateQualifiedName(namespace == null ? "" : namespace, qualified);
-    if (namespace === "http://www.w3.org/1999/xhtml") {
-      const el = this.createElement(qualified);
+    // createElementNS's "create an element" steps do not fold case (that is
+    // an HTML-document-specific step of createElement()/the HTML parser, not
+    // part of element creation itself), so this must not go through
+    // createElement()'s lowercasing. A colon here means a prefixed qualified
+    // name, which the generic namespace path below already splits correctly;
+    // only the common unprefixed case reuses the HTML internal-creation steps
+    // (template contents, custom element upgrade) that createElement relies on.
+    if (namespace === "http://www.w3.org/1999/xhtml" && !qualified.includes(":")) {
+      const el = this._createElementInternal(qualified);
       if (el) el._ns = namespace;
       return el;
     }
@@ -5845,7 +5862,10 @@ class Document extends Node {
     const localName = qualified.includes(":")
       ? qualified.slice(qualified.indexOf(":") + 1)
       : qualified;
-    el._tagName = qualified;
+    // HTML-uppercased qualified name (DOM 4.5): uppercase applies to the
+    // whole qualified name, prefix included, and only in the HTML namespace.
+    // The unprefixed HTML-namespace case never reaches here (handled above).
+    el._tagName = effectiveNamespace === "http://www.w3.org/1999/xhtml" ? qualified.toUpperCase() : qualified;
     el._lname = localName;
     el._ns = effectiveNamespace;
     el._nullNamespaceAttrs = new Map();

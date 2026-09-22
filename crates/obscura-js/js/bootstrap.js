@@ -933,6 +933,17 @@ const _elementsByTagName = (rootNid, qualifiedName) => {
   return _liveHTMLCollection(() =>
     (_domParse("elements_by_qualified_name", rootNid, name) || []).map(_wrapEl).filter(Boolean));
 };
+// Document's [SameObject] live HTMLCollections (HTML 3.1.5): forms, images,
+// links and scripts. Each getter must keep handing back the same object, so the
+// collection is built once and stored on the document.
+const _docLiveCollection = (doc, slot, selector, attrSensitive) => {
+  let list = doc[slot];
+  if (!list) {
+    list = _liveHTMLCollection(() => doc.querySelectorAll(selector), attrSensitive);
+    Object.defineProperty(doc, slot, { value: list });
+  }
+  return list;
+};
 let _consoleOid = 0;
 const _consoleObjectId = (value) => {
   const objectId = "console-" + (globalThis.__obscura_frameId >>> 0) + "-" + (++_consoleOid);
@@ -4767,26 +4778,39 @@ class Element extends Node {
   // Label association, per the HTML labelable-elements list. Playwright's
   // getByLabel and its follow-label retargeting read these; without them a
   // label-linked control is invisible to that engine.
+  // A labelable element "has a NodeList object associated with it that
+  // represents the list of label elements, in tree order, whose labeled control
+  // is the element"; the getter "must return that NodeList object" (HTML
+  // 4.10.19.9) - live, and the same object every time. Membership turns on the
+  // `id` and `for` attributes as well as the tree, so it tracks the
+  // attribute-inclusive epoch.
   get labels() {
     if (!_isLabelable(this)) return _nodeList([]);
     const doc = this.ownerDocument;
     if (!doc || !doc.querySelectorAll) return _nodeList([]);
-    const out = [];
-    const id = this.getAttribute('id');
-    if (id) {
-      // Filter in JS rather than building a selector: an id containing a
-      // quote would break out of label[for="..."].
-      const all = doc.querySelectorAll('label');
-      for (let i = 0; i < all.length; i++) {
-        if (all[i].getAttribute('for') === id) out.push(all[i]);
-      }
+    let list = this._labelsList;
+    if (!list) {
+      list = _liveNodeList(() => {
+        const out = [];
+        const id = this.getAttribute('id');
+        if (id) {
+          // Filter in JS rather than building a selector: an id containing a
+          // quote would break out of label[for="..."].
+          const all = doc.querySelectorAll('label');
+          for (let i = 0; i < all.length; i++) {
+            if (all[i].getAttribute('for') === id) out.push(all[i]);
+          }
+        }
+        let p = this.parentNode;
+        while (p) {
+          if (p.localName === 'label') out.push(p);
+          p = p.parentNode;
+        }
+        return out;
+      }, true);
+      Object.defineProperty(this, "_labelsList", { value: list });
     }
-    let p = this.parentNode;
-    while (p) {
-      if (p.localName === 'label') out.push(p);
-      p = p.parentNode;
-    }
-    return _nodeList(out);
+    return list;
   }
   get control() {
     if (this.localName !== 'label') return null;
@@ -4803,9 +4827,16 @@ class Element extends Node {
     }
     return null;
   }
+  // `[SameObject] readonly attribute HTMLOptionsCollection options` (HTML
+  // 4.10.7): live, and the same object on every read.
   get options() {
     if (this.localName !== 'select') return [];
-    return HTMLCollection._from(this.querySelectorAll('option'));
+    let list = this._optionsList;
+    if (!list) {
+      list = _liveHTMLCollection(() => this.querySelectorAll('option'));
+      Object.defineProperty(this, "_optionsList", { value: list });
+    }
+    return list;
   }
   add(item, before = null) {
     if (this.localName !== 'select') {
@@ -5759,7 +5790,14 @@ class Document extends Node {
   // Live HTMLCollection per DOM 4.5 ("list of elements with qualified name").
   getElementsByTagName(t) { return _elementsByTagName(this._nid, t); }
   getElementsByClassName(c) { return _getElementsByClassName(this, c); }
-  getElementsByName(name) { return this.querySelectorAll('[name="' + String(name).replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"]'); }
+  // "Returns a live NodeList containing all the HTML elements in that document
+  // that have a name attribute whose value is identical to elementName"
+  // (HTML 3.1.5). Membership follows the name attribute, so this tracks the
+  // attribute-inclusive epoch rather than tree shape alone.
+  getElementsByName(name) {
+    const selector = '[name="' + String(name).replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"]';
+    return _liveNodeList(() => this.querySelectorAll(selector), true);
+  }
   evaluate(expression, contextNode, namespaceResolver, type, result) {
     return _makeXPathResult(type, _xpathFindNodes(expression, contextNode || this));
   }
@@ -6219,10 +6257,13 @@ class Document extends Node {
     if (!this._styleSheetList) this._styleSheetList = new StyleSheetList(this);
     return this._styleSheetList;
   }
-  get forms() { return this.querySelectorAll("form"); }
-  get images() { return this.querySelectorAll("img"); }
-  get links() { return this.querySelectorAll("a[href], area[href]"); }
-  get scripts() { return this.querySelectorAll("script"); }
+  // HTML 3.1.5 declares these `[SameObject] readonly attribute HTMLCollection`,
+  // i.e. live and the same object on every read. `links` is the a/area elements
+  // that HAVE an href attribute, so it also has to follow attribute writes.
+  get forms() { return _docLiveCollection(this, "_formsList", "form", false); }
+  get images() { return _docLiveCollection(this, "_imagesList", "img", false); }
+  get links() { return _docLiveCollection(this, "_linksList", "a[href], area[href]", true); }
+  get scripts() { return _docLiveCollection(this, "_scriptsList", "script", false); }
   get cookie() {
     return __obscuraCore.ops.op_get_cookies();
   }
@@ -11164,8 +11205,17 @@ globalThis.DOMParser = class DOMParser {
       },
       get firstChild() { return root; },
       get lastChild() { return root; },
-      get children() { return [root]; },
-      get childNodes() { return [root]; },
+      // A document's child collections are a live HTMLCollection (DOM 4.2.6)
+      // and a live NodeList (DOM 4.4), not bare arrays; this document's only
+      // child is the wrapper element it was parsed into.
+      get children() {
+        if (!this._childrenList) this._childrenList = _liveHTMLCollection(() => [root]);
+        return this._childrenList;
+      },
+      get childNodes() {
+        if (!this._childNodesList) this._childNodesList = _liveNodeList(() => [root], false);
+        return this._childNodesList;
+      },
       // Document metadata the WHATWG interface exposes; DOMParser documents have
       // URL about:blank, are already fully parsed, and carry no stylesheets.
       get URL() { return "about:blank"; },
@@ -11193,7 +11243,8 @@ globalThis.DOMParser = class DOMParser {
       getElementById(id) {
         return walk(root, n => n.getAttribute && n.getAttribute("id") === id);
       },
-      // Live HTMLCollection per DOM 4.5, like the real Document's.
+      // Live HTMLCollection (DOM 4.5) and live NodeList (HTML 3.1.5), like the
+      // real Document's.
       getElementsByTagName(t) {
         return _elementsByTagName(root._nid, t);
       },
@@ -11201,7 +11252,8 @@ globalThis.DOMParser = class DOMParser {
         return _getElementsByClassName(root, c);
       },
       getElementsByName(n) {
-        return root.querySelectorAll(`[name="${n}"]`);
+        const selector = `[name="${n}"]`;
+        return _liveNodeList(() => root.querySelectorAll(selector), true);
       },
       createElement: (t) => document.createElement(t),
       createElementNS: (ns, t) => document.createElement(t),
@@ -12427,7 +12479,16 @@ globalThis.HTMLImageElement = HTMLImageElement;
 globalThis.HTMLInputElement = class HTMLInputElement extends HTMLElement {};
 globalThis.HTMLButtonElement = class HTMLButtonElement extends HTMLElement {};
 globalThis.HTMLFormElement = class HTMLFormElement extends HTMLElement {
-  get elements() { return HTMLCollection._from(this.querySelectorAll("input, select, textarea, button, fieldset, output, object")); }
+  // `[SameObject] readonly attribute HTMLFormControlsCollection elements`
+  // (HTML 4.10.3): live, and the same object on every read.
+  get elements() {
+    let list = this._elementsList;
+    if (!list) {
+      list = _liveHTMLCollection(() => this.querySelectorAll("input, select, textarea, button, fieldset, output, object"));
+      Object.defineProperty(this, "_elementsList", { value: list });
+    }
+    return list;
+  }
   get length() { return this.elements.length; }
   // Inherit submit() from Element.prototype: it dispatches the cancelable
   // 'submit' event and (if not prevented) builds form data and navigates.
@@ -12748,6 +12809,12 @@ function _nodeList(els) {
 //   getElementsByTagName    "list of elements with qualified name" (4.5, 4.9)
 //   getElementsByTagNameNS  "list of elements with namespace ..." (4.5, 4.9)
 //   getElementsByClassName  "list of elements with class names" (4.5, 4.9)
+//   getElementsByName       live NodeList (HTML 3.1.5)
+//   document.forms/images/  [SameObject] live HTMLCollection (HTML 3.1.5)
+//     links/scripts
+//   form.elements           [SameObject] live collection (HTML 4.10.3)
+//   select.options          [SameObject] live collection (HTML 4.10.7)
+//   labels                  live NodeList (HTML 4.10.19.9)
 // Static by spec, and deliberately left alone: querySelectorAll (4.2.6).
 //
 // Liveness without one DOM op per property access: the collection keeps a
@@ -12815,8 +12882,8 @@ const _defineLiveState = (target, query, attrSensitive) => {
 };
 // The first fill is eager so an invalid argument still throws from the call
 // that created the collection rather than from some later property read.
-const _liveNodeList = (query) =>
-  new Proxy(_liveRefresh(_defineLiveState(new NodeList(), query, false)), _liveNodeListProxy);
+const _liveNodeList = (query, attrSensitive) =>
+  new Proxy(_liveRefresh(_defineLiveState(new NodeList(), query, attrSensitive)), _liveNodeListProxy);
 const _liveHTMLCollection = (query, attrSensitive) =>
   new Proxy(_liveRefresh(_defineLiveState(new HTMLCollection(), query, attrSensitive)), _liveHTMLCollectionProxy);
 

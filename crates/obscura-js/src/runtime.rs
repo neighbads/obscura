@@ -21879,6 +21879,183 @@ mod tests {
         );
     }
 
+    // ---- The remaining live collections (R-46) --------------------------
+    // getElementsByName, form.elements, select.options and labels are live by
+    // spec too, and the document-level named collections are both live and
+    // [SameObject].
+
+    const FORM_FIXTURE: &str = r#"<html><body><form id="f">
+        <label for="a">A</label><input id="a" name="nm">
+        <select id="s"><option value="1">1</option><option value="2">2</option></select>
+        </form><div id="dst"></div></body></html>"#;
+
+    #[test]
+    fn get_elements_by_name_is_live() {
+        let mut rt = setup_runtime(FORM_FIXTURE);
+        let out = rt
+            .evaluate(
+                "(function(){var l=document.getElementsByName('nm');var r=[l.length];\
+                 var extra=document.createElement('input');extra.setAttribute('name','nm');\
+                 document.getElementById('dst').appendChild(extra);r.push(l.length);\
+                 extra.setAttribute('name','other');r.push(l.length);\
+                 extra.setAttribute('name','nm');r.push(l.length);\
+                 document.getElementById('dst').innerHTML='';r.push(l.length);\
+                 document.getElementById('a').remove();r.push(l.length);\
+                 return r.join(',')+';'+(l instanceof NodeList);})()",
+            )
+            .unwrap();
+        assert_eq!(
+            out,
+            serde_json::json!("1,2,1,2,1,0;true"),
+            "getElementsByName must be a live NodeList that follows the name attribute"
+        );
+    }
+
+    #[test]
+    fn form_elements_is_live_and_same_object() {
+        let mut rt = setup_runtime(FORM_FIXTURE);
+        let out = rt
+            .evaluate(
+                "(function(){var f=document.getElementById('f');var e=f.elements;\
+                 var same=f.elements===e;var r=[e.length];\
+                 f.appendChild(document.createElement('textarea'));r.push(e.length);\
+                 f.insertBefore(document.createElement('button'),f.firstChild);r.push(e.length);\
+                 f.replaceChild(document.createElement('output'),e[0]);r.push(e.length);\
+                 f.appendChild(e[0]);r.push(e.length);\
+                 document.getElementById('dst').appendChild(e[0]);r.push(e.length);\
+                 f.innerHTML='<input><input>';r.push(e.length);\
+                 return r.join(',')+';'+same;})()",
+            )
+            .unwrap();
+        assert_eq!(
+            out,
+            serde_json::json!("2,3,4,4,4,3,2;true"),
+            "form.elements must be live across append/insert/replace/move/innerHTML, and [SameObject]"
+        );
+    }
+
+    #[test]
+    fn select_options_is_live_and_same_object() {
+        let mut rt = setup_runtime(FORM_FIXTURE);
+        let out = rt
+            .evaluate(
+                "(function(){var s=document.getElementById('s');var o=s.options;\
+                 var same=s.options===o;var r=[o.length];\
+                 s.add(document.createElement('option'));r.push(o.length);\
+                 s.insertBefore(document.createElement('option'),s.firstChild);r.push(o.length);\
+                 s.removeChild(o[0]);r.push(o.length);\
+                 s.replaceChild(document.createElement('option'),o[0]);r.push(o.length);\
+                 s.innerHTML='<option>x</option>';r.push(o.length);\
+                 return r.join(',')+';'+same;})()",
+            )
+            .unwrap();
+        assert_eq!(
+            out,
+            serde_json::json!("2,3,4,3,3,1;true"),
+            "select.options must be live across every mutation path, and [SameObject]"
+        );
+    }
+
+    #[test]
+    fn labels_is_live_and_same_object() {
+        let mut rt = setup_runtime(FORM_FIXTURE);
+        let out = rt
+            .evaluate(
+                "(function(){var a=document.getElementById('a');var l=a.labels;\
+                 var same=a.labels===l;var r=[l.length];\
+                 var extra=document.createElement('label');extra.setAttribute('for','a');\
+                 document.getElementById('dst').appendChild(extra);r.push(l.length);\
+                 extra.setAttribute('for','zzz');r.push(l.length);\
+                 a.setAttribute('id','zzz');r.push(l.length);\
+                 a.setAttribute('id','a');extra.setAttribute('for','a');r.push(l.length);\
+                 var wrap=document.createElement('label');\
+                 document.getElementById('dst').appendChild(wrap);wrap.appendChild(a);\
+                 r.push(l.length);extra.remove();r.push(l.length);\
+                 return r.join(',')+';'+same+';'+(l instanceof NodeList);})()",
+            )
+            .unwrap();
+        assert_eq!(
+            out,
+            serde_json::json!("1,2,1,1,2,3,2;true;true"),
+            "labels must be a live NodeList following id/for writes and the tree, and [SameObject]"
+        );
+    }
+
+    #[test]
+    fn document_named_collections_are_live_and_same_object() {
+        let mut rt = setup_runtime(FORM_FIXTURE);
+        let out = rt
+            .evaluate(
+                "(function(){var f=document.forms,i=document.images,\
+                 s=document.scripts,k=document.links;\
+                 var same=f===document.forms&&i===document.images\
+                 &&s===document.scripts&&k===document.links;\
+                 var kinds=[f,i,s,k].every(function(c){return c instanceof HTMLCollection;});\
+                 var d=document.getElementById('dst');var r=[f.length,i.length,s.length,k.length];\
+                 d.appendChild(document.createElement('form'));r.push(f.length);\
+                 d.appendChild(document.createElement('img'));r.push(i.length);\
+                 d.appendChild(document.createElement('script'));r.push(s.length);\
+                 var a=document.createElement('a');d.appendChild(a);r.push(k.length);\
+                 a.setAttribute('href','#x');r.push(k.length);\
+                 a.removeAttribute('href');r.push(k.length);\
+                 d.innerHTML='';r.push([f.length,i.length,s.length,k.length].join('/'));\
+                 return r.join(',')+';'+same+';'+kinds;})()",
+            )
+            .unwrap();
+        assert_eq!(
+            out,
+            serde_json::json!("1,0,0,0,2,1,1,0,1,0,1/0/0/0;true;true"),
+            "document.forms/images/scripts/links must be live [SameObject] HTMLCollections"
+        );
+    }
+
+    #[test]
+    fn dom_parser_document_collections_have_spec_types_and_are_live() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let out = rt
+            .evaluate(
+                "(function(){var d=new DOMParser().parseFromString(\
+                 '<html><body><p></p><i name=\\'nm\\'></i></body></html>','text/html');\
+                 var kinds=(d.children instanceof HTMLCollection)&&(d.childNodes instanceof NodeList)\
+                 &&(d.getElementsByTagName('p') instanceof HTMLCollection)\
+                 &&(d.getElementsByName('nm') instanceof NodeList);\
+                 var same=d.children===d.children&&d.childNodes===d.childNodes;\
+                 var tags=d.getElementsByTagName('p');var named=d.getElementsByName('nm');\
+                 var r=[tags.length,named.length];\
+                 d.body.appendChild(d.createElement('p'));r.push(tags.length);\
+                 var extra=d.createElement('i');extra.setAttribute('name','nm');\
+                 d.body.appendChild(extra);r.push(named.length);\
+                 d.body.innerHTML='';r.push(tags.length+'/'+named.length);\
+                 return r.join(',')+';'+kinds+';'+same+';'+d.children.length;})()",
+            )
+            .unwrap();
+        assert_eq!(
+            out,
+            serde_json::json!("1,1,2,2,0/0;true;true;1"),
+            "the DOMParser document's collections must have spec types and be live"
+        );
+    }
+
+    #[test]
+    fn iframe_document_get_elements_by_tag_name_is_live() {
+        let mut rt = setup_runtime("<html><body><iframe id='f'></iframe></body></html>");
+        let out = rt
+            .evaluate(
+                "(function(){var d=document.getElementById('f').contentDocument;\
+                 d.body.innerHTML='<p></p><p></p>';\
+                 var c=d.getElementsByTagName('p');var r=[c instanceof HTMLCollection,c.length];\
+                 d.body.appendChild(d.createElement('p'));r.push(c.length);\
+                 d.body.removeChild(c[0]);r.push(c.length);\
+                 d.body.innerHTML='';r.push(c.length);return r.join(',');})()",
+            )
+            .unwrap();
+        assert_eq!(
+            out,
+            serde_json::json!("true,2,3,2,0"),
+            "the iframe document shim must return a live HTMLCollection"
+        );
+    }
+
     // ---- getElementsByTagName qualified-name matching (R-47) ------------
     // DOM 4.5/4.9: in an HTML document the argument matches HTML-namespace
     // elements only after ASCII-lowercasing, and every other namespace only
